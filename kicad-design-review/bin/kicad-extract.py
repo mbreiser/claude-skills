@@ -114,8 +114,25 @@ class Position:
 
 
 @dataclass
+class InstanceRef:
+    """One per-instance refdes binding for a schematic symbol.
+
+    A symbol placed in a sub-sheet referenced N times gets one InstanceRef per
+    instance path; the per-path Reference can differ from the symbol's default
+    Reference property.
+    """
+    path: str           # "/<root_uuid>/<sheet_uuid>/..."
+    reference: str      # per-instance refdes (e.g. "J19" when default is "J5")
+    unit: int = 1
+
+
+@dataclass
 class SchSymbol:
-    """A symbol instance in a schematic (refdes + lib_id + position)."""
+    """A symbol instance in a schematic (refdes + lib_id + position).
+
+    v1.1 additions: uuid, unit (default; instance_refs may override per-path),
+    instance_refs.
+    """
     refdes: str
     lib_id: str
     sheet: str
@@ -123,6 +140,9 @@ class SchSymbol:
     rotation: float = 0.0
     mirror: str = ""
     properties: dict[str, str] = field(default_factory=dict)
+    uuid: str | None = None
+    unit: int = 1
+    instance_refs: list[InstanceRef] = field(default_factory=list)
 
 
 @dataclass
@@ -135,15 +155,55 @@ class SchLabel:
 
 
 @dataclass
+class SheetPin:
+    """A pin on a hierarchical sheet (parent-side connection point)."""
+    name: str
+    shape: str    # "input" | "output" | "bidirectional" | "passive" | etc.
+    pos: tuple[float, float]
+
+
+@dataclass
 class SchSheet:
-    """A hierarchical sheet reference."""
+    """A hierarchical sheet reference (v1.1: now carries uuid + sheet pins)."""
     name: str
     file: str
     parent: str | None  # parent sheet relative path
+    uuid: str | None = None
+    at_pos: tuple[float, float] | None = None
+    pins: list[SheetPin] = field(default_factory=list)
+
+
+@dataclass
+class SymPinDef:
+    """A pin definition extracted from a (lib_symbols ...) entry.
+
+    primary_name is the pin's `(name "...")`. alternates contains any
+    `(alternate "...")` siblings (alternate functions like ADC, PWM, etc.).
+    """
+    number: str
+    primary_name: str
+    alternates: list[str] = field(default_factory=list)
+    unit: int = 1
+
+
+@dataclass
+class SchematicInstance:
+    """One resolved (instance_path, refdes, lib_id) tuple for the JSON output.
+
+    The flat `schematic_instances[]` array enumerates these so consumers can
+    iterate over per-instance refdeses without re-walking the sheet hierarchy.
+    """
+    instance_path: str
+    file: str
+    refdes: str
+    lib_id: str
+    unit: int = 1
+    symbol_uuid: str | None = None
 
 
 @dataclass
 class Fact:
+    """v1.1 additions: symbol_pin_name, pin_alternates, instance_confirmed."""
     category: str           # e.g. "spi_bus", "power_rail", "io"
     function: str           # e.g. "SCK_B0", "AIN0", "EINT"
     refdes: str | None = None
@@ -152,6 +212,10 @@ class Fact:
     part: str | None = None
     confidence: str = "single-source"
     notes: list[str] = field(default_factory=list)
+    # New in v1.1:
+    symbol_pin_name: str | None = None       # e.g. "GPIO45_ADC5", "D14", "OUT"
+    pin_alternates: list[str] = field(default_factory=list)
+    instance_confirmed: bool = False         # True if refdes resolved via instance walker
 
 
 @dataclass
@@ -746,6 +810,277 @@ def _at_xy(node: list) -> tuple[float, float, float]:
     return (x, y, rot)
 
 
+# ---------------------------------------------------------------------------
+# (lib_symbols ...) parser — v1.1
+# ---------------------------------------------------------------------------
+#
+# KiCad ≥ 7 schematics embed a (lib_symbols ...) block at the top of each
+# sheet caching every symbol used in that sheet. Each entry is:
+#
+#   (symbol "lib:Name"
+#     (pin (number "X") (name "GP45_ADC5") (at ...) ...)
+#     (pin ...) ...
+#   )
+#
+# Multi-unit symbols nest sub-symbols whose names follow the convention
+# "Name_M_N" (M = body style, N = unit number), and the pin definitions
+# live inside those sub-symbols rather than the parent.
+#
+# The map we build: (lib_id, unit, pin_number) -> SymPinDef.
+
+# Match library-cache symbol names. KiCad convention: <name>_<unit>_<body_style>
+# where unit ≥ 1 selects the sub-unit (A/B/...) and body_style is 0 (common) or
+# 1 (DeMorgan-equivalent). Unit 0 means "shared across all units" (drawn body
+# graphics, optionally pins shared between units like power rails).
+_LIB_SUB_NAME_RE = re.compile(r"^(?P<base>.+)_(?P<unit>\d+)_(?P<body>\d+)$")
+
+
+def _extract_pin_def(pin_node: list, default_unit: int) -> SymPinDef | None:
+    """Extract a SymPinDef from a (pin ...) node inside lib_symbols.
+
+    Pin form (KiCad ≥ 7):
+      (pin OUTPUT line (at X Y ROT) (length L)
+        (name "PrimaryName" ...)
+        (number "X" ...)
+        (alternate "AltName" line OUTPUT) ...
+      )
+    """
+    number_node = _sexp_get(pin_node, "number")
+    name_node = _sexp_get(pin_node, "name")
+    if not number_node or len(number_node) < 2:
+        return None
+    if not name_node or len(name_node) < 2:
+        return None
+    number = _sexp_str(number_node[1])
+    primary = _sexp_str(name_node[1])
+    alternates: list[str] = []
+    for child in pin_node:
+        if (isinstance(child, list) and child
+                and isinstance(child[0], sexpdata.Symbol)
+                and str(child[0]) == "alternate"
+                and len(child) >= 2):
+            alternates.append(_sexp_str(child[1]))
+    return SymPinDef(
+        number=number,
+        primary_name=primary,
+        alternates=alternates,
+        unit=default_unit,
+    )
+
+
+def parse_lib_symbols(sch_root: Any) -> dict[tuple[str, int, str], SymPinDef]:
+    """Walk top-level children of (lib_symbols ...) in a schematic root.
+
+    Returns: dict keyed by (lib_id, unit, pin_number) -> SymPinDef.
+
+    Design notes:
+      - Walk only top-level (lib_symbols ...) children, NOT recursive — we
+        deliberately avoid _sexp_walk on the whole tree because it would also
+        match nested (symbol ...) blocks elsewhere (instances, etc.).
+      - Multi-unit: when a top-level symbol contains nested (symbol "Name_M_N"
+        ...) children, recurse one level into them and tag pins with unit N.
+      - When pins live directly under the top-level symbol (single-unit case),
+        tag them as unit 1.
+    """
+    pin_map: dict[tuple[str, int, str], SymPinDef] = {}
+
+    lib_symbols_node = _sexp_get(sch_root, "lib_symbols")
+    if not lib_symbols_node:
+        return pin_map
+
+    # Iterate top-level (symbol "lib:Name" ...) entries only.
+    for child in lib_symbols_node[1:]:  # skip the head symbol "lib_symbols"
+        if not (isinstance(child, list) and child
+                and isinstance(child[0], sexpdata.Symbol)
+                and str(child[0]) == "symbol"):
+            continue
+        if len(child) < 2:
+            continue
+        lib_id = _sexp_str(child[1])
+
+        # Pins directly at top-level (single-unit symbols) → unit 1.
+        for grandchild in child[2:]:
+            if not isinstance(grandchild, list) or not grandchild:
+                continue
+            if not isinstance(grandchild[0], sexpdata.Symbol):
+                continue
+            head = str(grandchild[0])
+            if head == "pin":
+                pin_def = _extract_pin_def(grandchild, default_unit=1)
+                if pin_def is not None:
+                    pin_map[(lib_id, pin_def.unit, pin_def.number)] = pin_def
+            elif head == "symbol" and len(grandchild) >= 2:
+                # Multi-unit: nested (symbol "Name_M_N" ...) — extract unit.
+                sub_name = _sexp_str(grandchild[1])
+                m = _LIB_SUB_NAME_RE.match(sub_name)
+                unit = int(m.group("unit")) if m else 1
+                # Pins live inside the sub-symbol.
+                for great in grandchild[2:]:
+                    if (isinstance(great, list) and great
+                            and isinstance(great[0], sexpdata.Symbol)
+                            and str(great[0]) == "pin"):
+                        pin_def = _extract_pin_def(great, default_unit=unit)
+                        if pin_def is not None:
+                            # Keep one entry per (lib_id, unit, pin_number).
+                            # Body-style 0 (common) and N (per-unit) can both
+                            # contain pins; if body-style 0 and per-unit
+                            # sub-symbols both define the same pin, prefer
+                            # the per-unit definition (more specific).
+                            existing = pin_map.get((lib_id, unit, pin_def.number))
+                            if existing is None or unit > 0:
+                                pin_map[(lib_id, unit, pin_def.number)] = pin_def
+    return pin_map
+
+
+def parse_kicad_sym_file(path: Path) -> dict[tuple[str, int, str], SymPinDef]:
+    """Parse a project-local .kicad_sym file.
+
+    Used as a fallback when a refdes's lib_id isn't found in any sheet's
+    embedded lib_symbols. The file's top-level form is (kicad_symbol_lib ...);
+    its symbol entries follow the same shape as lib_symbols entries.
+
+    Returns: dict keyed by (lib_id, unit, pin_number) -> SymPinDef. The lib_id
+    in the returned keys is keyed on the *symbol name* alone (no nickname
+    prefix) — caller must match against either the bare name or the full
+    "nickname:Name" lib_id of the schematic instance.
+    """
+    pin_map: dict[tuple[str, int, str], SymPinDef] = {}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        root = sexpdata.loads(raw)
+    except Exception:
+        return pin_map
+
+    # The root is (kicad_symbol_lib (version ...) (symbol "Name" ...) ...).
+    if not (isinstance(root, list) and root
+            and isinstance(root[0], sexpdata.Symbol)
+            and str(root[0]) == "kicad_symbol_lib"):
+        return pin_map
+
+    for child in root[1:]:
+        if not (isinstance(child, list) and child
+                and isinstance(child[0], sexpdata.Symbol)
+                and str(child[0]) == "symbol"):
+            continue
+        if len(child) < 2:
+            continue
+        sym_name = _sexp_str(child[1])
+
+        for grandchild in child[2:]:
+            if not isinstance(grandchild, list) or not grandchild:
+                continue
+            if not isinstance(grandchild[0], sexpdata.Symbol):
+                continue
+            head = str(grandchild[0])
+            if head == "pin":
+                pd = _extract_pin_def(grandchild, default_unit=1)
+                if pd is not None:
+                    pin_map[(sym_name, pd.unit, pd.number)] = pd
+            elif head == "symbol" and len(grandchild) >= 2:
+                sub_name = _sexp_str(grandchild[1])
+                m = _LIB_SUB_NAME_RE.match(sub_name)
+                unit = int(m.group("unit")) if m else 1
+                for great in grandchild[2:]:
+                    if (isinstance(great, list) and great
+                            and isinstance(great[0], sexpdata.Symbol)
+                            and str(great[0]) == "pin"):
+                        pd = _extract_pin_def(great, default_unit=unit)
+                        if pd is not None:
+                            existing = pin_map.get((sym_name, unit, pd.number))
+                            if existing is None or unit > 0:
+                                pin_map[(sym_name, unit, pd.number)] = pd
+    return pin_map
+
+
+def lookup_pin_name(
+    pin_maps: dict[tuple[str, int, str], SymPinDef],
+    lib_id: str,
+    unit: int,
+    pin_number: str,
+) -> SymPinDef | None:
+    """Look up a pin definition. Falls back gracefully across unit / lib_id
+    forms a real KiCad project might use.
+
+    Lookup order:
+      1. (lib_id, unit, pin) exact
+      2. (lib_id, 0, pin) — unit 0 = pins shared across all units (e.g. power)
+      3. (lib_id, 1, pin) — single-unit symbols default
+      4. Bare symbol name (split on ':') with the same unit fallbacks —
+         covers project-local .kicad_sym matches where the lib_id includes a
+         nickname prefix the .kicad_sym file doesn't have.
+    """
+    candidate_lib_ids = [lib_id]
+    bare = lib_id.split(":", 1)[-1]
+    if bare != lib_id:
+        candidate_lib_ids.append(bare)
+
+    candidate_units = [unit]
+    if unit != 0:
+        candidate_units.append(0)
+    if unit != 1:
+        candidate_units.append(1)
+
+    for lid in candidate_lib_ids:
+        for u in candidate_units:
+            key = (lid, u, pin_number)
+            if key in pin_maps:
+                return pin_maps[key]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pin-coordinate transform (v1.1)
+# ---------------------------------------------------------------------------
+#
+# Compute absolute pin coordinates from a symbol instance's position +
+# rotation + mirror, given the pin's offset from the symbol origin (the
+# offset is read from the symbol's pin definition in lib_symbols).
+#
+# Used by the Phase 2 BFS engine. Defined here in Phase 1 so the formula
+# is documented in the same module as the data it operates on.
+#
+# Math:
+#   1. Apply symbol rotation around symbol origin to (px, py) offset.
+#   2. Translate by symbol_origin to get absolute position.
+#   3. Apply mirror flip per (mirror x|y) — done in symbol-local frame
+#      BEFORE rotation, since KiCad applies mirror first then rotation.
+#
+# KiCad rotations are CCW, in degrees, applied in the symbol's local frame.
+
+def absolute_pin_position(
+    symbol_origin: tuple[float, float],
+    symbol_rotation: float,
+    symbol_mirror: str,
+    pin_offset: tuple[float, float],
+) -> tuple[float, float]:
+    """Compute the absolute (x, y) of a pin given symbol placement + pin offset.
+
+    Args:
+      symbol_origin: (X, Y) — symbol instance position from `(at X Y ROT)`.
+      symbol_rotation: degrees CCW — from same `(at)` block.
+      symbol_mirror: "" | "x" | "y" — KiCad `(mirror x|y)` token; "" if absent.
+      pin_offset: (px, py) — pin position relative to symbol origin (from
+        `(pin ... (at px py prot))` in lib_symbols).
+
+    Returns: absolute (x, y) of the pin.
+
+    NOTE: KiCad applies mirror in the symbol's local frame BEFORE rotation.
+    """
+    import math
+    px, py = pin_offset
+    if symbol_mirror == "x":
+        # Mirror across X axis (negate Y in local frame)
+        py = -py
+    elif symbol_mirror == "y":
+        # Mirror across Y axis (negate X)
+        px = -px
+    rad = math.radians(symbol_rotation)
+    cos_r, sin_r = math.cos(rad), math.sin(rad)
+    rx = px * cos_r - py * sin_r
+    ry = px * sin_r + py * cos_r
+    return (symbol_origin[0] + rx, symbol_origin[1] + ry)
+
+
 def probe_schematic_version(path: Path) -> tuple[str | None, str | None]:
     """Read (version YYYYMMDD) and (generator ...) from a .kicad_sch root.
 
@@ -765,8 +1100,76 @@ def probe_schematic_version(path: Path) -> tuple[str | None, str | None]:
     return (version, generator)
 
 
-def parse_schematic(path: Path, sheet_name: str) -> tuple[list[SchSymbol], list[SchLabel], list[SchSheet]]:
-    """Parse a single .kicad_sch file. Returns (symbols, labels, sheets)."""
+def _extract_uuid(node: list) -> str | None:
+    """Extract `(uuid "...")` from a node's immediate children."""
+    u = _sexp_get(node, "uuid")
+    if u and len(u) >= 2:
+        return _sexp_str(u[1])
+    return None
+
+
+def _extract_instance_refs(sym_node: list) -> list[InstanceRef]:
+    """Extract per-instance refdes bindings from a (symbol ...) node.
+
+    KiCad schematics store these in:
+      (instances
+        (project "..."
+          (path "/<root_uuid>/<sheet_uuid>/..."
+            (reference "J19") (unit 1))
+          ...
+        )
+        ...
+      )
+
+    Returns one InstanceRef per (path, reference) tuple found.
+    """
+    out: list[InstanceRef] = []
+    instances = _sexp_get(sym_node, "instances")
+    if not instances:
+        return out
+    for proj in instances[1:]:
+        if not (isinstance(proj, list) and proj
+                and isinstance(proj[0], sexpdata.Symbol)
+                and str(proj[0]) == "project"):
+            continue
+        for path_node in proj[1:]:
+            if not (isinstance(path_node, list) and path_node
+                    and isinstance(path_node[0], sexpdata.Symbol)
+                    and str(path_node[0]) == "path"):
+                continue
+            if len(path_node) < 2:
+                continue
+            inst_path = _sexp_str(path_node[1])
+            ref_node = _sexp_get(path_node, "reference")
+            unit_node = _sexp_get(path_node, "unit")
+            if not ref_node or len(ref_node) < 2:
+                continue
+            reference = _sexp_str(ref_node[1])
+            unit = 1
+            if unit_node and len(unit_node) >= 2:
+                try:
+                    unit = int(_sexp_str(unit_node[1]))
+                except (ValueError, TypeError):
+                    unit = 1
+            out.append(InstanceRef(
+                path=inst_path, reference=reference, unit=unit,
+            ))
+    return out
+
+
+def parse_schematic(
+    path: Path, sheet_name: str,
+) -> tuple[
+    list[SchSymbol], list[SchLabel], list[SchSheet],
+    dict[tuple[str, int, str], SymPinDef],
+]:
+    """Parse a single .kicad_sch file.
+
+    Returns (symbols, labels, sheets, lib_symbols_pin_map).
+
+    v1.1: also extracts symbol UUIDs, units, instance_refs, sheet UUIDs +
+    sheet pins, and the per-sheet lib_symbols pin map.
+    """
     raw = path.read_text(encoding="utf-8", errors="replace")
     try:
         root = sexpdata.loads(raw)
@@ -777,9 +1180,12 @@ def parse_schematic(path: Path, sheet_name: str) -> tuple[list[SchSymbol], list[
     labels: list[SchLabel] = []
     sheets: list[SchSheet] = []
 
+    # v1.1: parse the per-sheet lib_symbols block once.
+    lib_pin_map = parse_lib_symbols(root)
+
     # Walk symbol instances. Note: in KiCad ≥ 7 schematics, the structure is
     #   (symbol (lib_id "...") (at X Y ROT) (mirror ...) (property "Reference" "U1" ...) ...)
-    # We avoid `(library_symbols ...)` (the symbol cache) by only walking
+    # We avoid `(lib_symbols ...)` (the symbol cache) by only walking
     # top-level (symbol ...) entries that have a (lib_id) child *and* a
     # (property "Reference" ...) child.
     for sym in _sexp_walk(root, "symbol"):
@@ -806,6 +1212,18 @@ def parse_schematic(path: Path, sheet_name: str) -> tuple[list[SchSymbol], list[
         refdes = properties.get("Reference", "")
         if not refdes:
             continue
+
+        # v1.1: symbol UUID, unit, instance_refs.
+        sym_uuid = _extract_uuid(sym)
+        unit_node = _sexp_get(sym, "unit")
+        unit = 1
+        if unit_node and len(unit_node) >= 2:
+            try:
+                unit = int(_sexp_str(unit_node[1]))
+            except (ValueError, TypeError):
+                unit = 1
+        instance_refs = _extract_instance_refs(sym)
+
         symbols.append(SchSymbol(
             refdes=refdes,
             lib_id=lib_id,
@@ -814,6 +1232,9 @@ def parse_schematic(path: Path, sheet_name: str) -> tuple[list[SchSymbol], list[
             rotation=rot,
             mirror=mirror,
             properties=properties,
+            uuid=sym_uuid,
+            unit=unit,
+            instance_refs=instance_refs,
         ))
 
     # Labels: local, hierarchical, global, power.
@@ -852,22 +1273,57 @@ def parse_schematic(path: Path, sheet_name: str) -> tuple[list[SchSymbol], list[
             elif k == "Sheetfile":
                 sheet_file = v
         if sheet_file:
+            # v1.1: extract sheet UUID + position + sheet pins.
+            sh_uuid = _extract_uuid(sh)
+            sh_x, sh_y, _ = _at_xy(sh)
+            sheet_pins: list[SheetPin] = []
+            for child in sh:
+                if not (isinstance(child, list) and child
+                        and isinstance(child[0], sexpdata.Symbol)
+                        and str(child[0]) == "pin"):
+                    continue
+                if len(child) < 3:
+                    continue
+                pin_name = _sexp_str(child[1])
+                shape = _sexp_str(child[2]) if isinstance(child[2], sexpdata.Symbol) else "passive"
+                px, py, _ = _at_xy(child)
+                sheet_pins.append(SheetPin(
+                    name=pin_name, shape=shape, pos=(px, py),
+                ))
             sheets.append(SchSheet(
                 name=sheet_name_val or sheet_file,
                 file=sheet_file,
                 parent=sheet_name,
+                uuid=sh_uuid,
+                at_pos=(sh_x, sh_y),
+                pins=sheet_pins,
             ))
 
-    return symbols, labels, sheets
+    return symbols, labels, sheets, lib_pin_map
 
 
-def walk_schematic_tree(root_sch: Path) -> dict[str, dict]:
+def walk_schematic_tree(root_sch: Path) -> tuple[
+    dict[str, dict],
+    dict[tuple[str, int, str], SymPinDef],
+    list[SchematicInstance],
+]:
     """Walk the schematic hierarchy starting at root_sch.
 
-    Returns dict mapping sheet rel-path → {symbols, labels, sheets}.
+    Returns (file_keyed_schematic, merged_lib_pin_map, schematic_instances):
+      file_keyed_schematic: dict mapping sheet rel-path → {symbols, labels, sheets, root_uuid}.
+        Backward-compat with v1's shape; symbols entries now include uuid /
+        unit / instance_refs fields per v1.1 dataclass changes.
+      merged_lib_pin_map: union of every per-sheet lib_pin_map keyed by
+        (lib_id, unit, pin_number).
+      schematic_instances: flat list of resolved (instance_path, refdes) pairs.
+        For each symbol's instance_refs, one entry per (path, reference). When
+        a symbol has no instance_refs (rare; older schematics), a single entry
+        is emitted using the symbol's default Reference and a placeholder path.
     """
     base = root_sch.parent
     result: dict[str, dict] = {}
+    merged_pin_map: dict[tuple[str, int, str], SymPinDef] = {}
+    schematic_instances: list[SchematicInstance] = []
     pending: list[tuple[Path, str]] = [(root_sch, root_sch.name)]
     visited: set[str] = set()
     while pending:
@@ -877,10 +1333,36 @@ def walk_schematic_tree(root_sch: Path) -> dict[str, dict]:
             continue
         visited.add(rel)
         try:
-            syms, lbls, sheets = parse_schematic(path, rel)
+            syms, lbls, sheets, lib_pin_map = parse_schematic(path, rel)
         except Exception as e:
             print(f"WARN: failed parsing {rel}: {e}", file=sys.stderr)
             continue
+        # Merge per-sheet lib_pin_map; later entries don't overwrite earlier
+        # (the same lib_id resolves consistently across sheets in practice).
+        for k, v in lib_pin_map.items():
+            merged_pin_map.setdefault(k, v)
+        # Emit one SchematicInstance per (symbol, instance_ref).
+        for sym in syms:
+            if sym.instance_refs:
+                for iref in sym.instance_refs:
+                    schematic_instances.append(SchematicInstance(
+                        instance_path=iref.path,
+                        file=rel,
+                        refdes=iref.reference,
+                        lib_id=sym.lib_id,
+                        unit=iref.unit,
+                        symbol_uuid=sym.uuid,
+                    ))
+            else:
+                # Fallback: no instances block — emit single pseudo-instance.
+                schematic_instances.append(SchematicInstance(
+                    instance_path=f"/<no-instance>/{sym.uuid or sym.refdes}",
+                    file=rel,
+                    refdes=sym.refdes,
+                    lib_id=sym.lib_id,
+                    unit=sym.unit,
+                    symbol_uuid=sym.uuid,
+                ))
         result[rel] = {
             "symbols": [asdict(s) for s in syms],
             "labels": [asdict(l) for l in lbls],
@@ -890,7 +1372,7 @@ def walk_schematic_tree(root_sch: Path) -> dict[str, dict]:
             sub = base / sh.file
             if sub.exists() and str(sub.relative_to(base)) not in visited:
                 pending.append((sub, sh.file))
-    return result
+    return result, merged_pin_map, schematic_instances
 
 
 # ---------------------------------------------------------------------------
@@ -958,12 +1440,19 @@ def build_facts(
     bom: list[BOMEntry],
     netlist: list[NetlistEntry],
     schematics: dict[str, dict],
+    schematic_instances: list[SchematicInstance] | None = None,
+    pin_maps: dict[tuple[str, int, str], SymPinDef] | None = None,
 ) -> list[Fact]:
     """Cross-reference BOM × netlist × schematic into structured facts.
 
-    For v1, this emits one fact per BOM entry that's also referenced in the
-    netlist. Confidence is bom+netlist or bom+netlist+schematic depending on
-    whether the refdes also appears in the parsed schematic.
+    v1.1: when schematic_instances and pin_maps are provided, also resolves
+    `symbol_pin_name` + `pin_alternates` per fact and sets
+    `instance_confirmed = True` when the refdes is found in any
+    schematic_instance.
+
+    Confidence string format remains v1-compatible (`netlist`, `netlist+bom`,
+    `netlist+bom+schematic`) so existing consumers don't break. Instance-walk
+    resolution surfaces via the new `instance_confirmed` boolean field.
     """
     bom_by_refdes = {e.refdes: e for e in bom}
 
@@ -972,11 +1461,24 @@ def build_facts(
     for e in netlist:
         netlist_by_refdes[e.refdes].append(e)
 
-    # Build a set of refdeses present in the schematic.
+    # Build a set of refdeses present in the schematic (file-level walk).
     schematic_refdeses: set[str] = set()
     for sheet in schematics.values():
         for s in sheet["symbols"]:
             schematic_refdeses.add(s["refdes"])
+
+    # v1.1: build per-refdes lib_id and the *set* of units seen across all
+    # instances of that refdes. Multi-unit symbols (e.g. dual op-amps with
+    # U83 unit A and U83 unit B) need the lookup to try every unit since
+    # different pins live on different units.
+    instance_refdes_libid: dict[str, str] = {}
+    instance_refdes_units: dict[str, set[int]] = defaultdict(set)
+    instance_refdes_set: set[str] = set()
+    if schematic_instances:
+        for inst in schematic_instances:
+            instance_refdes_set.add(inst.refdes)
+            instance_refdes_libid.setdefault(inst.refdes, inst.lib_id)
+            instance_refdes_units[inst.refdes].add(inst.unit)
 
     facts: list[Fact] = []
     # Emit one fact per refdes-pin in the netlist, joined to BOM.
@@ -989,7 +1491,25 @@ def build_facts(
             confidence_base.append("schematic")
         confidence = "+".join(confidence_base)
 
+        instance_confirmed = refdes in instance_refdes_set
+        lib_id = instance_refdes_libid.get(refdes)
+        # Try units in the order: smallest first, so unit 1 → unit 2 → ...
+        # plus 0 (shared across units). lookup_pin_name's internal fallbacks
+        # cover the rest.
+        units_to_try = sorted(instance_refdes_units.get(refdes, {1})) or [1]
+
         for ne in entries:
+            # v1.1: resolve symbol_pin_name + alternates if we have a lib_id.
+            symbol_pin_name = None
+            pin_alternates: list[str] = []
+            if pin_maps and lib_id is not None:
+                for u in units_to_try:
+                    pin_def = lookup_pin_name(pin_maps, lib_id, u, ne.pin)
+                    if pin_def is not None:
+                        symbol_pin_name = pin_def.primary_name
+                        pin_alternates = list(pin_def.alternates)
+                        break
+
             f = Fact(
                 category=_categorize(refdes, ne.net),
                 function=ne.net,
@@ -1000,6 +1520,9 @@ def build_facts(
                      (bom_entry.manufacturer_pn if bom_entry else None) or None,
                 confidence=confidence,
                 notes=[],
+                symbol_pin_name=symbol_pin_name,
+                pin_alternates=pin_alternates,
+                instance_confirmed=instance_confirmed,
             )
             if bom_entry and bom_entry.lcsc:
                 f.notes.append(f"LCSC: {bom_entry.lcsc}")
@@ -1255,16 +1778,42 @@ def main() -> int:
             # Don't bail; warn once via doc_quality (added later in this fn).
             sch_versions[f]["untested"] = True
 
-    # ---- Schematic walk ----
+    # ---- Schematic walk (v1.1: also returns lib_pin_map + instances) ----
     root_sch_rel = find_root_schematic(file_paths)
     schematics: dict[str, dict] = {}
+    pin_maps: dict[tuple[str, int, str], SymPinDef] = {}
+    schematic_instances: list[SchematicInstance] = []
     if root_sch_rel:
         root_sch = project_root / root_sch_rel
         if root_sch.exists():
-            schematics = walk_schematic_tree(root_sch)
+            schematics, pin_maps, schematic_instances = walk_schematic_tree(root_sch)
 
-    # ---- Facts ----
-    facts = build_facts(bom, netlist, schematics)
+    # ---- Project-local .kicad_sym fallback (v1.1) ----
+    # If schematic instances reference lib_ids that aren't in the embedded
+    # lib_symbols cache, scan project-local .kicad_sym files and merge their
+    # pin definitions in.
+    embedded_lib_ids = {k[0] for k in pin_maps.keys()}
+    referenced_lib_ids = {inst.lib_id for inst in schematic_instances}
+    unresolved_lib_ids = referenced_lib_ids - embedded_lib_ids
+    # Also try bare-name match (lib_id "panel_custom:Foo" → bare "Foo").
+    bare_resolved = {lib_id.split(":", 1)[-1] for lib_id in embedded_lib_ids}
+    truly_unresolved = {
+        lib_id for lib_id in unresolved_lib_ids
+        if lib_id.split(":", 1)[-1] not in bare_resolved
+    }
+    if truly_unresolved:
+        for f in file_paths:
+            if not f.endswith(".kicad_sym"):
+                continue
+            sym_full = project_root / f
+            if not sym_full.exists():
+                continue
+            local_pins = parse_kicad_sym_file(sym_full)
+            for k, v in local_pins.items():
+                pin_maps.setdefault(k, v)
+
+    # ---- Facts (v1.1: pass pin_maps + schematic_instances) ----
+    facts = build_facts(bom, netlist, schematics, schematic_instances, pin_maps)
 
     # ---- Doc quality ----
     findings, questions = find_doc_quality(
@@ -1305,6 +1854,7 @@ def main() -> int:
         "netlist": [asdict(n) for n in netlist],
         "positions": [asdict(p) for p in positions],
         "schematic": schematics,
+        "schematic_instances": [asdict(i) for i in schematic_instances],
         "facts": [asdict(f) for f in facts],
         "doc_quality": [asdict(f) for f in findings],
         "open_questions": [asdict(q) for q in questions],
@@ -1317,6 +1867,14 @@ def main() -> int:
             "n_facts": len(facts),
             "n_doc_quality": len(findings),
             "n_kicad_sch_files": len(sch_versions),
+            "n_lib_pin_defs": len(pin_maps),
+            "n_schematic_instances": len(schematic_instances),
+            "n_facts_with_pin_name": sum(
+                1 for f in facts if f.symbol_pin_name is not None
+            ),
+            "n_facts_instance_confirmed": sum(
+                1 for f in facts if f.instance_confirmed
+            ),
         },
     }
 
