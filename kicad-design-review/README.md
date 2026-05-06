@@ -51,13 +51,41 @@ Add `.kicad-review/` to `.gitignore` in the working repo before running.
 }
 ```
 
-## Known limitations (v1)
+## Known limitations (v1.1)
 
-- **Net names are truncated to 14 characters** when sourced from `netlist.ipc` (IPC-D-356A standard limit). Full names exist in the schematic but cross-reference to the IPC nets isn't implemented in v1.
-- **GPIO name resolution** (e.g. footprint-pin 56 → "GP45") requires parsing `.kicad_sym` library files to extract symbol-pin alt-name tables. Not implemented in v1; consumers map footprint pins to GPIO names externally.
-- **Wire-trace through passive transit** (e.g. follow R25 to its other terminal then to the panel-EINT bus) is not implemented. Production extracts (BOM × netlist) cover ~80 % of typical questions; the rest needs schematic graph BFS, which is a v1.1 candidate.
-- **KiCad schema versioning**: v1 was tested against KiCad 7.x output. Other versions may parse but with degraded fidelity.
-- **Symbol library parsing**: not implemented. Symbol metadata is read from the schematic instances directly; if the schematic doesn't embed symbols (older KiCad), some details may be missing.
+### Resolved in v1.1
+- **Net names truncated to 14 characters** — still happens (IPC-D-356A standard), but `symbol_pin_name` (from `lib_symbols`) gives an honest, untruncated identifier per pin alongside the truncated `net_name`.
+- **GPIO name resolution** — done via `(lib_symbols)` parsing in v1.1. ~99-100 % of facts on G6 boards now have `symbol_pin_name` resolved (e.g. footprint pin 56 → `GPIO45_ADC5`).
+- **Sheet-instance walker** — fixes v1's "313/1494 facts confirmed" recall on hierarchical boards; v1.1 resolves per-instance refdeses (e.g. arena's panel-column J5 → J19/J23/...).
+- **Multi-unit symbols** — handled. OPA2277 unit A pins 1-4 / unit B pins 5-8 correctly disambiguated.
+- **KiCad schema-version probe** — `(version YYYYMMDD)` and `(generator)` recorded per file; out-of-range versions emit a doc-quality finding without bailing.
+- **Cache versioning** — `manifest.json` per cache dir; loud warning + refetch on stale (v1-shaped) caches.
+
+### v1.1 partial / experimental
+- **Wire-trace through passive transit** — Phase 2 prototype behind `--trace-pin` flag, output in `_experimental.wire_traces[]`. Validated on cleanly-bounded cases (e.g. crystal-circuit transit through 1kΩ resistor; MCP4725 → AOUT label + BNC). Default transit: resistors + ferrites only; refuses GND/power; capacitors deliberately not transit-able.
+- **Single-sheet BFS only** — no cross-sheet hierarchical-label propagation in v1.1. Pins whose connections live on another sheet trace to the sheet boundary (or `(unconnected)`); cross-sheet via sheet-pin matching is deferred to v1.2.
+- **No bus-alias expansion** — arena uses bus-style sheet pins (`PAN{PAN}`, `TNY{TNY}`, `AIN{AIN}`, `I2C{I2C}`); BFS doesn't expand them in v1.1. v1.2 candidate.
+- **Active-component signal flow** — BFS terminates at active-IC pins. Tracing through op-amps / mux / level-translators (e.g. AIN0 → OPA2277 → BNC) is not modelled. Acceptance softened: "reaches OPA2277 input pin" rather than "through OPA2277 chain". v1.3 territory.
+- **Pin-coordinate transform on large multi-pin chips** — edge case observed on the RP2350 80-pin QFN where U2 pin 56 BFS finds many decoupling-cap endpoints. Suggests a transform issue specific to large symbols with rotation/mirror combinations. v1.2 candidate.
+
+### Still deferred to v1.2 / later
+- **`sym-lib-table` parsing** with KiCad env-var substitution (`${KIPRJMOD}` etc.). v1.1 falls back to project-local `.kicad_sym` filename-stem matching only.
+- **Reconcile mode** (KiCad source ↔ existing markdown design doc).
+- **Multi-revision diff** (e.g. v0.2 → v0.3 deltas).
+- **`.kicad_pcb` layout review** — different domain.
+
+## Wire-trace usage (Phase 2, experimental)
+
+```bash
+./bin/kicad-extract.py \
+  --source 'iorodeo/LED-Display_G6_Hardware_Panel@prod_v0p2r0:panel_rp2354_20x20_v0p2' \
+  --trace-pin 'Y1:1,U85:1,R29:1' \
+  | jq '._experimental.wire_traces'
+```
+
+Each trace returns: `{source: {refdes, pin, sheet, position}, path: [...], endpoints: [...], confidence: "single-sheet"}`. Endpoints are labels (with `label_kind`), other component pins (with `<refdes>:<pin> (<symbol_pin_name>)`), or boundary markers (`(unconnected)`, sheet-pin → file).
+
+Override transit defaults: `--transit-prefix R,FB,L` (default: `R,FB`).
 
 ## Tested against
 

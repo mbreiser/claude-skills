@@ -179,11 +179,60 @@ class SymPinDef:
 
     primary_name is the pin's `(name "...")`. alternates contains any
     `(alternate "...")` siblings (alternate functions like ADC, PWM, etc.).
+    pin_offset is the pin's (at X Y ROT) in the symbol-local coordinate frame
+    — the connection-point coordinate where wires attach, before applying
+    symbol-instance rotation/mirror/translation. Used by the Phase 2 BFS.
     """
     number: str
     primary_name: str
     alternates: list[str] = field(default_factory=list)
     unit: int = 1
+    pin_offset: tuple[float, float] = (0.0, 0.0)
+
+
+@dataclass
+class Wire:
+    """A wire segment between two coords on a sheet (Phase 2)."""
+    start: tuple[float, float]
+    end: tuple[float, float]
+
+
+@dataclass
+class Junction:
+    """A junction marker — 3+ wires meeting at one coord (Phase 2)."""
+    pos: tuple[float, float]
+
+
+@dataclass
+class WireTraceStep:
+    """One step in a wire-trace path (Phase 2): a wire segment, a junction,
+    or a passive transit through a 2-pin component."""
+    kind: str               # "wire" | "junction" | "transit"
+    position: tuple[float, float] | None = None
+    end_position: tuple[float, float] | None = None  # for "wire"
+    refdes: str | None = None      # for "transit"
+    value: str | None = None       # for "transit"
+    transit_via: str | None = None # for "transit": which pin we entered/exited
+
+
+@dataclass
+class WireTraceEndpoint:
+    """An endpoint reached by a wire-trace BFS (Phase 2)."""
+    kind: str               # "label" | "pin" | "boundary"
+    value: str              # label name, "<refdes>:<pin>", or "(unconnected)"
+    position: tuple[float, float] | None = None
+    sheet: str | None = None
+    label_kind: str | None = None  # for kind="label": "local"|"hierarchical"|"global"|"power"
+
+
+@dataclass
+class WireTrace:
+    """Result of a single BFS from a (refdes, pin) source (Phase 2)."""
+    source: dict             # {"refdes", "pin", "sheet", "position"}
+    path: list[WireTraceStep]
+    endpoints: list[WireTraceEndpoint]
+    confidence: str = "single-sheet"
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -860,11 +909,15 @@ def _extract_pin_def(pin_node: list, default_unit: int) -> SymPinDef | None:
                 and str(child[0]) == "alternate"
                 and len(child) >= 2):
             alternates.append(_sexp_str(child[1]))
+    # Pin offset (symbol-local frame) — the connection-point coord where
+    # wires attach before instance rotation/mirror/translation are applied.
+    offset_x, offset_y, _ = _at_xy(pin_node)
     return SymPinDef(
         number=number,
         primary_name=primary,
         alternates=alternates,
         unit=default_unit,
+        pin_offset=(offset_x, offset_y),
     )
 
 
@@ -1162,13 +1215,15 @@ def parse_schematic(
 ) -> tuple[
     list[SchSymbol], list[SchLabel], list[SchSheet],
     dict[tuple[str, int, str], SymPinDef],
+    list[Wire], list[Junction],
 ]:
     """Parse a single .kicad_sch file.
 
-    Returns (symbols, labels, sheets, lib_symbols_pin_map).
+    Returns (symbols, labels, sheets, lib_symbols_pin_map, wires, junctions).
 
     v1.1: also extracts symbol UUIDs, units, instance_refs, sheet UUIDs +
-    sheet pins, and the per-sheet lib_symbols pin map.
+    sheet pins, the per-sheet lib_symbols pin map, plus wires and junctions
+    for the Phase 2 BFS engine.
     """
     raw = path.read_text(encoding="utf-8", errors="replace")
     try:
@@ -1179,6 +1234,8 @@ def parse_schematic(
     symbols: list[SchSymbol] = []
     labels: list[SchLabel] = []
     sheets: list[SchSheet] = []
+    wires: list[Wire] = []
+    junctions: list[Junction] = []
 
     # v1.1: parse the per-sheet lib_symbols block once.
     lib_pin_map = parse_lib_symbols(root)
@@ -1299,31 +1356,61 @@ def parse_schematic(
                 pins=sheet_pins,
             ))
 
-    return symbols, labels, sheets, lib_pin_map
+    # v1.1 Phase 2: wires + junctions for the BFS engine.
+    # (wire (pts (xy X1 Y1) (xy X2 Y2)) ...) — segments are 2-point in KiCad ≥ 7.
+    for w in _sexp_walk(root, "wire"):
+        pts = _sexp_get(w, "pts")
+        if not pts:
+            continue
+        coords: list[tuple[float, float]] = []
+        for child in pts[1:]:
+            if (isinstance(child, list) and child
+                    and isinstance(child[0], sexpdata.Symbol)
+                    and str(child[0]) == "xy"
+                    and len(child) >= 3):
+                try:
+                    coords.append((float(child[1]), float(child[2])))
+                except (ValueError, TypeError):
+                    continue
+        # Emit one Wire per consecutive pair of points (2 points = 1 segment;
+        # KiCad ≥ 7 always uses 2-point wires but we tolerate longer pts lists).
+        for i in range(len(coords) - 1):
+            wires.append(Wire(start=coords[i], end=coords[i + 1]))
+
+    # (junction (at X Y) (diameter D) ...)
+    for j in _sexp_walk(root, "junction"):
+        if not _sexp_get(j, "at"):
+            continue
+        x, y, _ = _at_xy(j)
+        junctions.append(Junction(pos=(x, y)))
+
+    return symbols, labels, sheets, lib_pin_map, wires, junctions
 
 
 def walk_schematic_tree(root_sch: Path) -> tuple[
     dict[str, dict],
     dict[tuple[str, int, str], SymPinDef],
     list[SchematicInstance],
+    dict[str, dict],
 ]:
     """Walk the schematic hierarchy starting at root_sch.
 
-    Returns (file_keyed_schematic, merged_lib_pin_map, schematic_instances):
-      file_keyed_schematic: dict mapping sheet rel-path → {symbols, labels, sheets, root_uuid}.
+    Returns (file_keyed_schematic, merged_lib_pin_map, schematic_instances, sheet_geometry):
+      file_keyed_schematic: dict mapping sheet rel-path → {symbols, labels, sheets}.
         Backward-compat with v1's shape; symbols entries now include uuid /
         unit / instance_refs fields per v1.1 dataclass changes.
       merged_lib_pin_map: union of every per-sheet lib_pin_map keyed by
         (lib_id, unit, pin_number).
       schematic_instances: flat list of resolved (instance_path, refdes) pairs.
-        For each symbol's instance_refs, one entry per (path, reference). When
-        a symbol has no instance_refs (rare; older schematics), a single entry
-        is emitted using the symbol's default Reference and a placeholder path.
+      sheet_geometry: dict per-sheet → {wires, junctions, symbols} carrying the
+        raw dataclass instances (NOT asdicted) — used by the Phase 2 BFS to
+        avoid re-parsing the schematic.
     """
     base = root_sch.parent
     result: dict[str, dict] = {}
     merged_pin_map: dict[tuple[str, int, str], SymPinDef] = {}
     schematic_instances: list[SchematicInstance] = []
+    sheet_geometry: dict[str, dict] = {}
     pending: list[tuple[Path, str]] = [(root_sch, root_sch.name)]
     visited: set[str] = set()
     while pending:
@@ -1333,10 +1420,19 @@ def walk_schematic_tree(root_sch: Path) -> tuple[
             continue
         visited.add(rel)
         try:
-            syms, lbls, sheets, lib_pin_map = parse_schematic(path, rel)
+            syms, lbls, sheets, lib_pin_map, wires, junctions = parse_schematic(
+                path, rel,
+            )
         except Exception as e:
             print(f"WARN: failed parsing {rel}: {e}", file=sys.stderr)
             continue
+        sheet_geometry[rel] = {
+            "wires": wires,
+            "junctions": junctions,
+            "symbols": syms,
+            "labels": lbls,
+            "sheets": sheets,
+        }
         # Merge per-sheet lib_pin_map; later entries don't overwrite earlier
         # (the same lib_id resolves consistently across sheets in practice).
         for k, v in lib_pin_map.items():
@@ -1372,7 +1468,499 @@ def walk_schematic_tree(root_sch: Path) -> tuple[
             sub = base / sh.file
             if sub.exists() and str(sub.relative_to(base)) not in visited:
                 pending.append((sub, sh.file))
-    return result, merged_pin_map, schematic_instances
+    return result, merged_pin_map, schematic_instances, sheet_geometry
+
+
+# ---------------------------------------------------------------------------
+# Wire-trace BFS engine (Phase 2 — _experimental)
+# ---------------------------------------------------------------------------
+#
+# Single-sheet BFS through wires + junctions, with optional transit through
+# tightly-defaulted 2-pin passives (resistors / ferrites only by default).
+#
+# v1.1 limitations explicitly documented in --help:
+#   - Single-sheet only (no cross-sheet hierarchical labels via sheet pins)
+#   - No bus alias expansion
+#   - No active-component signal flow (BFS terminates at active IC pins)
+#   - Refuses paths through GND/power terminals
+#   - Output is _experimental.wire_traces[] — shape may change in v1.2
+
+# Coord-key precision: KiCad rounds positions to 0.0001 mm internally.
+# Normalizing to 4 decimal places gives stable graph keys without losing
+# precision. (Codex catch: floats as graph keys cause subtle mismatches.)
+COORD_PRECISION = 4
+
+# Default refdes prefixes whose 2-pin instances are transit-able. Codex catch:
+# capacitors NOT transit-able by default (decoupling, RC filter, shunt all
+# produce wrong paths). User can override via --transit-prefix.
+DEFAULT_TRANSIT_PREFIXES = ("R", "FB")
+
+# Net names (or label names) that signal "this is a power/ground rail; don't
+# trace through". BFS terminates at these without traversing further.
+POWER_NET_PATTERNS = (
+    re.compile(r"^GND$"),
+    re.compile(r"^GNDA$"),
+    re.compile(r"^\+?\d+(\.\d+)?V\d*$"),  # +3V3, +5V, -15V, +1V1, etc.
+    re.compile(r"^V(IN|BUS|DD|CC|SS|EE)$"),
+    re.compile(r"^Earth$|^EARTH$|^PE$"),
+)
+
+
+def _norm_coord(p: tuple[float, float]) -> tuple[str, str]:
+    """Normalize a (x, y) pair to fixed-precision string keys for graph hashing."""
+    return (f"{p[0]:.{COORD_PRECISION}f}", f"{p[1]:.{COORD_PRECISION}f}")
+
+
+def _is_power_net(name: str) -> bool:
+    """True if a label/net name looks like a power or ground rail."""
+    s = name.strip()
+    return any(rx.match(s) for rx in POWER_NET_PATTERNS)
+
+
+def _on_segment(p: tuple[float, float], a: tuple[float, float],
+                b: tuple[float, float], tol: float = 1e-3) -> bool:
+    """True if point p is on segment a-b (collinear AND between endpoints)."""
+    # Reject if p coincides with either endpoint — endpoints are already nodes.
+    if (abs(p[0] - a[0]) < tol and abs(p[1] - a[1]) < tol):
+        return False
+    if (abs(p[0] - b[0]) < tol and abs(p[1] - b[1]) < tol):
+        return False
+    # Cross product == 0 → collinear; bounding box check confirms between.
+    cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+    if abs(cross) > tol:
+        return False
+    minx, maxx = sorted((a[0], b[0]))
+    miny, maxy = sorted((a[1], b[1]))
+    return minx - tol <= p[0] <= maxx + tol and miny - tol <= p[1] <= maxy + tol
+
+
+def _split_wires_at_contacts(
+    wires: list[Wire],
+    contact_points: list[tuple[float, float]],
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Codex catch: KiCad doesn't always emit explicit junctions for T-junctions
+    where a label / pin / wire endpoint lies on the midpoint of another wire.
+
+    For each wire segment, find any contact_points on its midpoint and split
+    the segment so each contact gets its own graph node. Returns a list of
+    (start, end) tuples representing the post-split wire segments.
+    """
+    out: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for w in wires:
+        # Find every contact strictly between start and end.
+        midpoints = [p for p in contact_points if _on_segment(p, w.start, w.end)]
+        if not midpoints:
+            out.append((w.start, w.end))
+            continue
+        # Sort midpoints along the segment so we emit contiguous sub-segments.
+        # Use distance-from-start as the sort key.
+        def dist_from_start(p: tuple[float, float]) -> float:
+            return ((p[0] - w.start[0]) ** 2 + (p[1] - w.start[1]) ** 2) ** 0.5
+        sorted_mids = sorted(midpoints, key=dist_from_start)
+        # Emit start → mid_1 → mid_2 → ... → end.
+        prev = w.start
+        for m in sorted_mids:
+            out.append((prev, m))
+            prev = m
+        out.append((prev, w.end))
+    return out
+
+
+def build_sheet_graph(
+    sheet_geom: dict,
+    pin_maps: dict[tuple[str, int, str], SymPinDef],
+    instance_units_for_refdes: dict[str, list[int]],
+) -> tuple[
+    dict[tuple[str, str], list[tuple[str, str]]],   # adjacency: norm_coord -> [norm_coord]
+    dict[tuple[str, str], list[dict]],              # tags: norm_coord -> [{kind, ...}]
+]:
+    """Build a single-sheet wire/junction/label graph for BFS.
+
+    Returns (adjacency, tags):
+      adjacency: dict from coord-key → list of neighbor coord-keys.
+      tags: dict from coord-key → list of {kind, ...} dicts describing what
+        lives at that coord (component pin, label, junction, sheet pin).
+    """
+    syms: list[SchSymbol] = sheet_geom["symbols"]
+    labels: list[SchLabel] = sheet_geom["labels"]
+    sheets: list[SchSheet] = sheet_geom["sheets"]
+    wires: list[Wire] = sheet_geom["wires"]
+    junctions: list[Junction] = sheet_geom["junctions"]
+
+    tags: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    contact_points: list[tuple[float, float]] = []
+
+    # Tag component pins (per-instance refdes; we use sym.refdes as the
+    # default since instance walker resolves it for each sheet).
+    for sym in syms:
+        units = instance_units_for_refdes.get(sym.refdes, [sym.unit, 1, 0])
+        # For each pin in the symbol's lib_symbols entry, compute absolute pos.
+        for u in units:
+            for (lib_id, unit, pin_num), pin_def in pin_maps.items():
+                if lib_id != sym.lib_id and not (
+                    sym.lib_id.endswith(":" + lib_id)
+                    or lib_id.endswith(":" + sym.lib_id)
+                ):
+                    continue
+                if unit != u:
+                    continue
+                abs_pos = absolute_pin_position(
+                    sym.pos, sym.rotation, sym.mirror, pin_def.pin_offset,
+                )
+                key = _norm_coord(abs_pos)
+                tags[key].append({
+                    "kind": "pin",
+                    "refdes": sym.refdes,
+                    "pin_number": pin_num,
+                    "pin_name": pin_def.primary_name,
+                    "lib_id": sym.lib_id,
+                    "abs_pos": abs_pos,
+                })
+                contact_points.append(abs_pos)
+
+    # Tag labels.
+    for lbl in labels:
+        key = _norm_coord(lbl.pos)
+        tags[key].append({
+            "kind": "label", "name": lbl.name, "label_kind": lbl.kind,
+            "abs_pos": lbl.pos,
+        })
+        contact_points.append(lbl.pos)
+
+    # Tag junctions.
+    for j in junctions:
+        key = _norm_coord(j.pos)
+        tags[key].append({"kind": "junction", "abs_pos": j.pos})
+        contact_points.append(j.pos)
+
+    # Tag sheet pins.
+    for sh in sheets:
+        for sp in sh.pins:
+            key = _norm_coord(sp.pos)
+            tags[key].append({
+                "kind": "sheet_pin",
+                "name": sp.name,
+                "shape": sp.shape,
+                "sheet_file": sh.file,
+                "abs_pos": sp.pos,
+            })
+            contact_points.append(sp.pos)
+
+    # Split wires at midpoint contacts before building adjacency.
+    wire_segments = _split_wires_at_contacts(wires, contact_points)
+
+    adjacency: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
+    for start, end in wire_segments:
+        ks, ke = _norm_coord(start), _norm_coord(end)
+        if ks == ke:
+            continue
+        adjacency[ks].append(ke)
+        adjacency[ke].append(ks)
+
+    return dict(adjacency), dict(tags)
+
+
+def find_pin_position_for_refdes(
+    refdes: str, pin_number: str,
+    syms: list[SchSymbol],
+    pin_maps: dict[tuple[str, int, str], SymPinDef],
+    instance_units_for_refdes: dict[str, list[int]],
+) -> tuple[float, float] | None:
+    """Look up the absolute coordinate of a (refdes, pin) on its sheet."""
+    for sym in syms:
+        if sym.refdes != refdes:
+            continue
+        units = instance_units_for_refdes.get(refdes, [sym.unit, 1, 0])
+        for u in units:
+            pin_def = lookup_pin_name(pin_maps, sym.lib_id, u, pin_number)
+            if pin_def is not None:
+                return absolute_pin_position(
+                    sym.pos, sym.rotation, sym.mirror, pin_def.pin_offset,
+                )
+    return None
+
+
+def bfs_trace(
+    start_pos: tuple[float, float],
+    start_refdes: str,
+    start_pin: str,
+    adjacency: dict[tuple[str, str], list[tuple[str, str]]],
+    tags: dict[tuple[str, str], list[dict]],
+    sheet_name: str,
+    bom_by_refdes: dict[str, BOMEntry],
+    transit_prefixes: tuple[str, ...] = DEFAULT_TRANSIT_PREFIXES,
+    max_steps: int = 5000,
+) -> WireTrace:
+    """Single-sheet BFS from a pin coord to nearest labels / other-component-pins.
+
+    Stop conditions (per branch):
+      - Hit a label → record as endpoint
+      - Hit a power label (matched by POWER_NET_PATTERNS) → record + stop
+      - Hit another component pin (passive transit allowed only for refdes
+        prefixes in transit_prefixes; non-passive pins terminate the branch)
+      - Hit a sheet pin → record (as a "boundary"; cross-sheet not in v1.1)
+      - Step budget exhausted → emit "boundary" with note
+    """
+    start_key = _norm_coord(start_pos)
+    if start_key not in adjacency and start_key not in tags:
+        # Pin coord doesn't appear in the graph — likely the wire endpoints
+        # don't exactly hit the pin. Try a small search radius. v1.1: just
+        # report unconnected.
+        return WireTrace(
+            source={"refdes": start_refdes, "pin": start_pin,
+                    "sheet": sheet_name, "position": list(start_pos)},
+            path=[],
+            endpoints=[WireTraceEndpoint(
+                kind="boundary", value="(no wire at pin)",
+                position=list(start_pos), sheet=sheet_name,
+            )],
+            confidence="single-sheet",
+            notes=["pin coord not in wire graph; pin may be unconnected or "
+                   "wire endpoints don't match (check transform math)"],
+        )
+
+    visited: set[tuple[str, str]] = {start_key}
+    endpoints: list[WireTraceEndpoint] = []
+    path_steps: list[WireTraceStep] = []
+    queue: list[tuple[tuple[str, str], tuple[float, float]]] = [(start_key, start_pos)]
+    steps = 0
+
+    while queue and steps < max_steps:
+        key, pos = queue.pop(0)
+        steps += 1
+
+        # Check what's at this coord — labels, other pins, junctions, sheet pins.
+        node_tags = tags.get(key, [])
+        terminate_branch = False
+        for t in node_tags:
+            kind = t["kind"]
+            if kind == "label":
+                # Power-rail labels stop the branch.
+                if _is_power_net(t["name"]):
+                    endpoints.append(WireTraceEndpoint(
+                        kind="label", value=t["name"],
+                        position=list(t["abs_pos"]), sheet=sheet_name,
+                        label_kind=t["label_kind"],
+                    ))
+                    terminate_branch = True
+                else:
+                    # Don't terminate — labels just annotate; keep walking
+                    # to discover all destinations on this net.
+                    endpoints.append(WireTraceEndpoint(
+                        kind="label", value=t["name"],
+                        position=list(t["abs_pos"]), sheet=sheet_name,
+                        label_kind=t["label_kind"],
+                    ))
+            elif kind == "pin":
+                if t["refdes"] == start_refdes and t["pin_number"] == start_pin:
+                    # Don't treat the source pin as an endpoint.
+                    continue
+                # Check whether this is a transit-allowed passive.
+                refdes_prefix = re.match(r"^([A-Za-z]+)", t["refdes"])
+                prefix_str = refdes_prefix.group(1) if refdes_prefix else ""
+                bom_entry = bom_by_refdes.get(t["refdes"])
+                # Transit only for 2-pin components with allowed prefix.
+                # We approximate "2-pin" via prefix + lookup count of pins for
+                # this refdes; lean v1.1 just trusts the prefix.
+                is_transit_allowed = prefix_str in transit_prefixes
+                if is_transit_allowed:
+                    # Transit: find the OTHER pin of this refdes and add it
+                    # to the queue (if we haven't visited it).
+                    other_pin_keys = [
+                        (k, t2) for k, lst in tags.items() for t2 in lst
+                        if t2.get("kind") == "pin"
+                        and t2.get("refdes") == t["refdes"]
+                        and t2.get("pin_number") != t["pin_number"]
+                    ]
+                    value_str = bom_entry.raw.get("value", "?") if bom_entry else "?"
+                    path_steps.append(WireTraceStep(
+                        kind="transit",
+                        refdes=t["refdes"],
+                        value=value_str,
+                        transit_via=f"{t['refdes']}:{t['pin_number']}",
+                        position=list(t["abs_pos"]),
+                    ))
+                    for ok, ot in other_pin_keys:
+                        if ok not in visited:
+                            visited.add(ok)
+                            queue.append((ok, ot["abs_pos"]))
+                else:
+                    # Active-component pin: BFS terminates here.
+                    endpoints.append(WireTraceEndpoint(
+                        kind="pin",
+                        value=f"{t['refdes']}:{t['pin_number']} ({t['pin_name']})",
+                        position=list(t["abs_pos"]), sheet=sheet_name,
+                    ))
+                    terminate_branch = True
+            elif kind == "sheet_pin":
+                endpoints.append(WireTraceEndpoint(
+                    kind="boundary",
+                    value=f"sheet-pin {t['name']} → {t['sheet_file']}",
+                    position=list(t["abs_pos"]), sheet=sheet_name,
+                ))
+                terminate_branch = True
+            elif kind == "junction":
+                path_steps.append(WireTraceStep(
+                    kind="junction", position=list(t["abs_pos"]),
+                ))
+
+        if terminate_branch:
+            continue
+
+        # Walk wire neighbors.
+        for nkey in adjacency.get(key, []):
+            if nkey in visited:
+                continue
+            visited.add(nkey)
+            # Find the nominal coord of nkey from any tag at nkey.
+            n_pos = None
+            for t in tags.get(nkey, []):
+                n_pos = t.get("abs_pos")
+                break
+            if n_pos is None:
+                # Coord might be a pure wire endpoint (no tag).
+                try:
+                    n_pos = (float(nkey[0]), float(nkey[1]))
+                except (ValueError, TypeError):
+                    n_pos = (0.0, 0.0)
+            path_steps.append(WireTraceStep(
+                kind="wire",
+                position=list(pos),
+                end_position=list(n_pos),
+            ))
+            queue.append((nkey, n_pos))
+
+    if not endpoints and steps >= max_steps:
+        endpoints.append(WireTraceEndpoint(
+            kind="boundary", value="(step budget exhausted)",
+            sheet=sheet_name,
+        ))
+    elif not endpoints:
+        endpoints.append(WireTraceEndpoint(
+            kind="boundary", value="(unconnected)",
+            sheet=sheet_name,
+        ))
+
+    return WireTrace(
+        source={"refdes": start_refdes, "pin": start_pin,
+                "sheet": sheet_name, "position": list(start_pos)},
+        path=path_steps,
+        endpoints=endpoints,
+        confidence="single-sheet",
+    )
+
+
+def parse_trace_pin_arg(arg: str | None) -> list[tuple[str, str]]:
+    """Parse `--trace-pin REF:PIN[,REF:PIN]...` into a list of (refdes, pin)."""
+    if not arg:
+        return []
+    out: list[tuple[str, str]] = []
+    for tok in arg.split(","):
+        tok = tok.strip()
+        if not tok or ":" not in tok:
+            continue
+        ref, pin = tok.split(":", 1)
+        out.append((ref.strip(), pin.strip()))
+    return out
+
+
+def run_traces(
+    trace_pins: list[tuple[str, str]],
+    sheet_geometry: dict[str, dict],
+    schematic_instances: list[SchematicInstance],
+    pin_maps: dict[tuple[str, int, str], SymPinDef],
+    bom: list[BOMEntry],
+    transit_prefixes: tuple[str, ...] = DEFAULT_TRANSIT_PREFIXES,
+) -> list[WireTrace]:
+    """Run BFS for each --trace-pin entry. Each trace is single-sheet:
+    we locate which sheet the refdes lives in via schematic_instances, then
+    BFS in that sheet's graph.
+    """
+    if not trace_pins:
+        return []
+
+    # Map refdes → list of (sheet_file, instance_unit) we've seen.
+    refdes_to_sheets: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for inst in schematic_instances:
+        refdes_to_sheets[inst.refdes].append((inst.file, inst.unit))
+
+    # Per-refdes set of units (for pin-name resolution fallback).
+    instance_units: dict[str, list[int]] = {}
+    for inst in schematic_instances:
+        instance_units.setdefault(inst.refdes, [])
+        if inst.unit not in instance_units[inst.refdes]:
+            instance_units[inst.refdes].append(inst.unit)
+
+    bom_by_refdes = {b.refdes: b for b in bom}
+
+    # Cache built graphs per sheet (BFS is repeated work otherwise).
+    graph_cache: dict[str, tuple[dict, dict]] = {}
+
+    traces: list[WireTrace] = []
+    for ref, pin in trace_pins:
+        sheets = refdes_to_sheets.get(ref, [])
+        if not sheets:
+            traces.append(WireTrace(
+                source={"refdes": ref, "pin": pin, "sheet": None, "position": None},
+                path=[],
+                endpoints=[WireTraceEndpoint(
+                    kind="boundary",
+                    value=f"refdes {ref} not in schematic_instances",
+                )],
+                confidence="single-sheet",
+                notes=["refdes not found"],
+            ))
+            continue
+        # Use first sheet (lean v1.1; multi-instance refdeses just take first).
+        sheet_file, _ = sheets[0]
+        if sheet_file not in sheet_geometry:
+            traces.append(WireTrace(
+                source={"refdes": ref, "pin": pin, "sheet": sheet_file, "position": None},
+                path=[],
+                endpoints=[WireTraceEndpoint(
+                    kind="boundary",
+                    value=f"sheet {sheet_file} not in geometry cache",
+                )],
+                confidence="single-sheet",
+            ))
+            continue
+
+        sheet_geom = sheet_geometry[sheet_file]
+
+        if sheet_file not in graph_cache:
+            graph_cache[sheet_file] = build_sheet_graph(
+                sheet_geom, pin_maps, instance_units,
+            )
+        adjacency, tags = graph_cache[sheet_file]
+
+        start_pos = find_pin_position_for_refdes(
+            ref, pin, sheet_geom["symbols"], pin_maps, instance_units,
+        )
+        if start_pos is None:
+            traces.append(WireTrace(
+                source={"refdes": ref, "pin": pin, "sheet": sheet_file, "position": None},
+                path=[],
+                endpoints=[WireTraceEndpoint(
+                    kind="boundary",
+                    value="pin coordinate could not be resolved",
+                )],
+                confidence="single-sheet",
+                notes=["lib_symbols missing pin offset, or symbol-instance "
+                       "rotation/mirror produced unexpected coords"],
+            ))
+            continue
+
+        traces.append(bfs_trace(
+            start_pos=start_pos,
+            start_refdes=ref,
+            start_pin=pin,
+            adjacency=adjacency,
+            tags=tags,
+            sheet_name=sheet_file,
+            bom_by_refdes=bom_by_refdes,
+            transit_prefixes=transit_prefixes,
+        ))
+    return traces
 
 
 # ---------------------------------------------------------------------------
@@ -1679,6 +2267,27 @@ def main() -> int:
                     help="Skip cache; re-fetch all files")
     ap.add_argument("--schema-version", default=None,
                     help="Force-allow a specific KiCad schema version")
+    # Phase 2 — wire-trace BFS prototype (experimental).
+    ap.add_argument(
+        "--trace-pin", default=None,
+        help=(
+            "Comma-separated list of REF:PIN sources to wire-trace via "
+            "single-sheet BFS. Output goes to _experimental.wire_traces[]. "
+            "Example: --trace-pin U2:44,U1:36. v1.1 limits: single-sheet "
+            "only; no cross-sheet labels; no bus expansion; resistors+ferrites "
+            "passive transit only by default; refuses paths through "
+            "GND/power; terminates at active-IC pins."
+        ),
+    )
+    ap.add_argument(
+        "--transit-prefix", default=",".join(DEFAULT_TRANSIT_PREFIXES),
+        help=(
+            f"Comma-separated refdes prefixes whose 2-pin instances are "
+            f"transit-able by the BFS. Default: {','.join(DEFAULT_TRANSIT_PREFIXES)} "
+            f"(resistors + ferrites). Capacitors are deliberately NOT "
+            f"transit-able by default (decoupling/filter false-positive risk)."
+        ),
+    )
     args = ap.parse_args()
 
     source = parse_source(args.source)
@@ -1778,15 +2387,17 @@ def main() -> int:
             # Don't bail; warn once via doc_quality (added later in this fn).
             sch_versions[f]["untested"] = True
 
-    # ---- Schematic walk (v1.1: also returns lib_pin_map + instances) ----
+    # ---- Schematic walk (v1.1: also returns lib_pin_map + instances + geometry) ----
     root_sch_rel = find_root_schematic(file_paths)
     schematics: dict[str, dict] = {}
     pin_maps: dict[tuple[str, int, str], SymPinDef] = {}
     schematic_instances: list[SchematicInstance] = []
+    sheet_geometry: dict[str, dict] = {}
     if root_sch_rel:
         root_sch = project_root / root_sch_rel
         if root_sch.exists():
-            schematics, pin_maps, schematic_instances = walk_schematic_tree(root_sch)
+            (schematics, pin_maps, schematic_instances,
+             sheet_geometry) = walk_schematic_tree(root_sch)
 
     # ---- Project-local .kicad_sym fallback (v1.1) ----
     # If schematic instances reference lib_ids that aren't in the embedded
@@ -1814,6 +2425,22 @@ def main() -> int:
 
     # ---- Facts (v1.1: pass pin_maps + schematic_instances) ----
     facts = build_facts(bom, netlist, schematics, schematic_instances, pin_maps)
+
+    # ---- Phase 2 wire-trace BFS (experimental, behind --trace-pin) ----
+    trace_pins = parse_trace_pin_arg(args.trace_pin)
+    transit_prefixes = tuple(
+        s.strip() for s in args.transit_prefix.split(",") if s.strip()
+    ) or DEFAULT_TRANSIT_PREFIXES
+    wire_traces: list[WireTrace] = []
+    if trace_pins:
+        wire_traces = run_traces(
+            trace_pins=trace_pins,
+            sheet_geometry=sheet_geometry,
+            schematic_instances=schematic_instances,
+            pin_maps=pin_maps,
+            bom=bom,
+            transit_prefixes=transit_prefixes,
+        )
 
     # ---- Doc quality ----
     findings, questions = find_doc_quality(
@@ -1858,6 +2485,18 @@ def main() -> int:
         "facts": [asdict(f) for f in facts],
         "doc_quality": [asdict(f) for f in findings],
         "open_questions": [asdict(q) for q in questions],
+        # _experimental: shape may change in v1.2. Currently single-sheet
+        # only; populated only when --trace-pin is passed.
+        "_experimental": {
+            "wire_traces": [asdict(t) for t in wire_traces],
+            "_notes": (
+                "Phase 2 BFS prototype. Single-sheet only; no cross-sheet "
+                "label propagation; no bus alias expansion; resistors+ferrites "
+                "passive-transit only by default; refuses paths through "
+                "GND/power rails; terminates at active-IC pins. Field shape "
+                "may change in v1.2."
+            ),
+        },
         "stats": {
             "n_files": len(file_inventory),
             "n_bom": len(bom),
@@ -1875,6 +2514,7 @@ def main() -> int:
             "n_facts_instance_confirmed": sum(
                 1 for f in facts if f.instance_confirmed
             ),
+            "n_wire_traces": len(wire_traces),
         },
     }
 
