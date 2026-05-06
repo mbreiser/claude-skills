@@ -43,6 +43,24 @@ from typing import Any, Iterable, Iterator
 import sexpdata
 
 # ---------------------------------------------------------------------------
+# Versions
+# ---------------------------------------------------------------------------
+
+EXTRACTOR_VERSION = "0.2.0"
+
+# Bumped whenever the JSON output shape changes in a way consumers can detect.
+# Keep additive changes within the same MINOR; breaking changes bump MAJOR.
+# v1.0 = baseline (no version field); v0.2.0 marks the first version with this
+# field present, plus inventory.kicad_schematic_versions and instance fields.
+OUTPUT_SCHEMA_VERSION = "0.2.0"
+
+# Set of KiCad schema versions we've validated parsing against. Files with
+# (version YYYYMMDD) outside this set still parse (we degrade gracefully) but
+# emit a doc-quality finding so consumers know parsing fidelity is unverified.
+# 20250114 = KiCad 9.x output; the G6 boards developed against v1 are this version.
+KICAD_SCHEMA_VERSIONS_TESTED = ("20250114",)
+
+# ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
 
@@ -351,7 +369,13 @@ def populate_cache(
         ".kicad_sch", ".kicad_sym", ".kicad_pro", ".kicad_pcb",
         ".csv", ".ipc", ".pos", ".net",
     )
-    relevant_name = ("netlist.ipc", "bom.csv", "positions.csv", "designators.csv")
+    relevant_name = (
+        "netlist.ipc", "bom.csv", "positions.csv", "designators.csv",
+        # sym-lib-table is a KiCad project-config file (no extension) describing
+        # external symbol library nicknames. Lean v1.1 doesn't parse it (deferred
+        # to v1.2), but include it in the cache so v1.2 doesn't need a re-fetch.
+        "sym-lib-table",
+    )
     for entry in blobs:
         rel = entry["path"]
         if not (rel.endswith(relevant_suffix) or any(
@@ -383,7 +407,13 @@ def local_inventory(root: Path) -> list[FileEntry]:
         ".kicad_sch", ".kicad_sym", ".kicad_pro", ".kicad_pcb",
         ".csv", ".ipc", ".pos", ".net",
     )
-    relevant_name = ("netlist.ipc", "bom.csv", "positions.csv", "designators.csv")
+    relevant_name = (
+        "netlist.ipc", "bom.csv", "positions.csv", "designators.csv",
+        # sym-lib-table is a KiCad project-config file (no extension) describing
+        # external symbol library nicknames. Lean v1.1 doesn't parse it (deferred
+        # to v1.2), but include it in the cache so v1.2 doesn't need a re-fetch.
+        "sym-lib-table",
+    )
     out: list[FileEntry] = []
     for p in root.rglob("*"):
         if not p.is_file():
@@ -632,6 +662,50 @@ def parse_ipc_netlist(text: str) -> list[NetlistEntry]:
 
 
 # ---------------------------------------------------------------------------
+# Cache manifest (v1.1)
+# ---------------------------------------------------------------------------
+
+def write_cache_manifest(cache_subdir: Path, source: Source) -> None:
+    """Write manifest.json into a cache dir so re-runs can detect stale caches."""
+    manifest = {
+        "extractor_version": EXTRACTOR_VERSION,
+        "output_schema_version": OUTPUT_SCHEMA_VERSION,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "source": asdict(source),
+    }
+    (cache_subdir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def read_cache_manifest(cache_subdir: Path) -> dict | None:
+    """Read manifest.json from a cache dir; return None if missing or unreadable."""
+    p = cache_subdir / "manifest.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def cache_is_stale(cache_subdir: Path) -> tuple[bool, str]:
+    """Return (is_stale, reason). Cache is stale if manifest is missing or
+    extractor_version / output_schema_version don't match current values."""
+    m = read_cache_manifest(cache_subdir)
+    if m is None:
+        # Cache exists but pre-dates manifest writing (v1 cache). Treat as stale.
+        if cache_subdir.exists() and any(cache_subdir.iterdir()):
+            return (True, "no manifest.json (v1-shaped cache)")
+        return (False, "empty cache; will populate")
+    ev = m.get("extractor_version")
+    sv = m.get("output_schema_version")
+    if ev != EXTRACTOR_VERSION:
+        return (True, f"extractor_version {ev} != {EXTRACTOR_VERSION}")
+    if sv != OUTPUT_SCHEMA_VERSION:
+        return (True, f"output_schema_version {sv} != {OUTPUT_SCHEMA_VERSION}")
+    return (False, "manifest matches")
+
+
+# ---------------------------------------------------------------------------
 # Schematic parser (sexpdata-based)
 # ---------------------------------------------------------------------------
 
@@ -670,6 +744,25 @@ def _at_xy(node: list) -> tuple[float, float, float]:
     y = float(pos[2])
     rot = float(pos[3]) if len(pos) > 3 else 0.0
     return (x, y, rot)
+
+
+def probe_schematic_version(path: Path) -> tuple[str | None, str | None]:
+    """Read (version YYYYMMDD) and (generator ...) from a .kicad_sch root.
+
+    Returns (version, generator). Either may be None if not found / parse fails.
+    Reads only the first ~2 KB; (version) and (generator) are emitted near the
+    top of every KiCad schematic, so a full parse isn't needed for the probe.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fp:
+            head = fp.read(2048)
+    except Exception:
+        return (None, None)
+    ver_match = re.search(r"\(version\s+(\d+)\)", head)
+    gen_match = re.search(r'\(generator\s+(?:"([^"]+)"|(\S+?))\s*\)', head)
+    version = ver_match.group(1) if ver_match else None
+    generator = (gen_match.group(1) or gen_match.group(2)) if gen_match else None
+    return (version, generator)
 
 
 def parse_schematic(path: Path, sheet_name: str) -> tuple[list[SchSymbol], list[SchLabel], list[SchSheet]]:
@@ -1073,24 +1166,48 @@ def main() -> int:
     file_inventory: list[FileEntry]
     project_root: Path
 
+    cache_status: dict[str, str] = {}  # surfaced into JSON output
+
     if source.kind == "github":
         fetcher.auth_check()
         source.resolved_sha = fetcher.resolve_ref(
             source.owner, source.repo, source.ref
         )
         cache_subdir = cache_root / cache_key(source)
-        if args.no_cache and cache_subdir.exists():
+
+        # v1.1: stale-cache detection. If the cache exists but predates the
+        # current extractor / output-schema version, warn loudly and refetch.
+        stale, reason = cache_is_stale(cache_subdir)
+        if stale and not args.no_cache:
+            print(
+                f"WARN: stale cache at {cache_subdir} ({reason}); refetching.",
+                file=sys.stderr,
+            )
             import shutil
             shutil.rmtree(cache_subdir)
+            cache_status["action"] = "stale-refetched"
+            cache_status["reason"] = reason
+        elif args.no_cache and cache_subdir.exists():
+            import shutil
+            shutil.rmtree(cache_subdir)
+            cache_status["action"] = "force-refetched"
+        else:
+            cache_status["action"] = "populated-or-served-from-cache"
+        cache_status["reason"] = cache_status.get("reason", reason)
+
         cache_subdir.mkdir(parents=True, exist_ok=True)
         # Fetch into the cache mirroring the path-within-repo. Files land at
         # cache_subdir/<rel-path-within-source.path> directly (populate_cache
         # uses paths relative to source.path), so project_root == cache_subdir.
         file_inventory = populate_cache(fetcher, source, cache_subdir)
         project_root = cache_subdir
+        # Stamp manifest after a successful population so a later run can detect
+        # the version this cache was built with.
+        write_cache_manifest(cache_subdir, source)
     else:
         project_root = Path(source.path)
         file_inventory = local_inventory(project_root)
+        cache_status["action"] = "local-source-no-cache"
 
     # Build path list (relative to project_root)
     file_paths = [e.rel_path for e in file_inventory]
@@ -1121,6 +1238,23 @@ def main() -> int:
             elif name.endswith("positions.csv"):
                 positions.extend(parse_positions(text))
 
+    # ---- Schematic-version probe (v1.1) ----
+    # Probe every .kicad_sch file for (version YYYYMMDD) + (generator ...).
+    # Recorded into inventory.kicad_schematic_versions so consumers can detect
+    # KiCad version drift without re-parsing the schematics.
+    sch_versions: dict[str, dict] = {}
+    for f in file_paths:
+        if not f.endswith(".kicad_sch"):
+            continue
+        full = project_root / f
+        if not full.exists():
+            continue
+        ver, gen = probe_schematic_version(full)
+        sch_versions[f] = {"version": ver, "generator": gen}
+        if ver and ver not in KICAD_SCHEMA_VERSIONS_TESTED:
+            # Don't bail; warn once via doc_quality (added later in this fn).
+            sch_versions[f]["untested"] = True
+
     # ---- Schematic walk ----
     root_sch_rel = find_root_schematic(file_paths)
     schematics: dict[str, dict] = {}
@@ -1138,15 +1272,34 @@ def main() -> int:
     )
 
     # ---- Emit JSON ----
+    untested_schema_files = [
+        f for f, info in sch_versions.items() if info.get("untested")
+    ]
+    if untested_schema_files:
+        findings.append(DocQualityFinding(
+            finding="kicad_schema_version_untested",
+            severity="info",
+            details=(
+                f"{len(untested_schema_files)} .kicad_sch file(s) have a "
+                f"(version YYYYMMDD) outside the tested range "
+                f"{KICAD_SCHEMA_VERSIONS_TESTED}. "
+                f"Output may be partial. Sample: {untested_schema_files[:3]}"
+            ),
+        ))
+
     out = {
-        "tool": {"name": "kicad-extract", "version": "0.1.0"},
+        "tool": {"name": "kicad-extract", "version": EXTRACTOR_VERSION},
+        "output_schema_version": OUTPUT_SCHEMA_VERSION,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "source": asdict(source),
         "cache_dir": str(cache_root),
+        "cache_status": cache_status,
         "inventory": {
             "all_files": [asdict(e) for e in file_inventory],
             "production_extract_dir": chosen_extract_dir,
             "root_schematic": root_sch_rel,
+            "kicad_schematic_versions": sch_versions,
+            "kicad_schema_versions_tested": list(KICAD_SCHEMA_VERSIONS_TESTED),
         },
         "bom": [asdict(b) for b in bom],
         "netlist": [asdict(n) for n in netlist],
@@ -1163,6 +1316,7 @@ def main() -> int:
             "n_schematic_sheets": len(schematics),
             "n_facts": len(facts),
             "n_doc_quality": len(findings),
+            "n_kicad_sch_files": len(sch_versions),
         },
     }
 
