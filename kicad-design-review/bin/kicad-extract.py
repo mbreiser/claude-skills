@@ -553,8 +553,9 @@ BOM_COL_ALIASES = {
     "description": ["description", "desc"],
     "manufacturer": ["manufacturer", "mfr", "mfg"],
     "manufacturer_pn": [
-        "mfr part", "manufacturer part number", "mpn", "mfr pn",
-        "manufacturer pn", "manufacturerpartnumber",
+        "mfr part", "mfr part number", "manufacturer part number",
+        "mpn", "mfr pn", "manufacturer pn", "manufacturerpartnumber",
+        "mfr#", "manufacturer#",
     ],
     "lcsc": ["lcsc", "lcsc part #", "lcsc part", "lcsc pn", "lcscpn"],
     "quantity": ["quantity", "qty", "count"],
