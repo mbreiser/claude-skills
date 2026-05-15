@@ -1,3 +1,11 @@
 
 # Codex cross-review working directory
 .codex-review/
+
+# kicad-design-review extractor cache (regenerated per run)
+.kicad-review/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
