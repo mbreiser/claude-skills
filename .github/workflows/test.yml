@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # kicad-design-review tests — synthetic-fixture pytest only; no gh api or
+  # network access required, so this runs cleanly in CI without auth.
+  kicad-design-review:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Run pytest (kicad-design-review)
+        working-directory: kicad-design-review
+        run: |
+          uv run --python ${{ matrix.python-version }} \
+            --with pytest --with sexpdata \
+            pytest tests/ -v
+
+      - name: Smoke-test extractor --help (PEP 723 deps via uv run --script)
+        working-directory: kicad-design-review
+        run: |
+          uv run --python ${{ matrix.python-version }} \
+            --script bin/kicad-extract.py --help
