@@ -29,6 +29,7 @@ ln -s "$(pwd)/codex-plan-review" ~/.claude/skills/codex-plan-review
 | [instruments](instruments/) | Control Digilent Analog Discovery 3 (AD3) and Saleae Logic Pro 8 test instruments via Python. Capture waveforms, generate trigger/stimulus signals, analyze oscilloscope / logic-analyzer traces. |
 | [nano-banana-artwork](nano-banana-artwork/) | Generate consistent character artwork via Google's Nano Banana Pro (gemini-3-pro-image-preview). Themed posters, logos, character sets with cross-image consistency. |
 | [kicad-design-review](kicad-design-review/) | KiCad PCB schematic review. Python extractor produces deterministic structured facts (BOM × netlist × schematic × positions, with confidence flags); skill synthesizes the human-readable design-review report. |
+| [pdf-sidecar](pdf-sidecar/) | Extract a PDF into a cached sidecar of markdown + images so Claude reads the markdown instead of paying tokens to re-read the raw PDF on every session. Marker backend by default, Docling on `--high-fidelity`. Built-in verification gate compares baseline word/image counts against what the backend actually emitted. |
 
 ## Dependencies
 
@@ -36,6 +37,7 @@ ln -s "$(pwd)/codex-plan-review" ~/.claude/skills/codex-plan-review
 - **instruments** requires Digilent Waveforms SDK (AD3) and/or Saleae Logic 2 (Saleae). Python 3.14 on macOS for AD3.
 - **kicad-design-review** requires Python 3.10+ and `kiutils` (installed via `pyproject.toml` in the skill directory).
 - **nano-banana-artwork** requires a Google AI Studio API key (`GOOGLE_GENAI_API_KEY`).
+- **pdf-sidecar** requires `uv` (for PEP 723 inline-deps). The default invocation is `uv run --script --with marker-pdf bin/pdf-sidecar.py paper.pdf`; `--high-fidelity` uses Docling instead (`--with docling`). Both backends are pulled lazily — only `pypdf` is in the script's PEP 723 header (used for the cheap baseline pass that detects scanned PDFs and seeds verification).
 
 Skills that need additional setup describe it in their own `SKILL.md` body.
 

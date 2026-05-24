@@ -5,6 +5,9 @@
 # kicad-design-review extractor cache (regenerated per run)
 .kicad-review/
 
+# pdf-sidecar extracted directories (live next to source PDFs)
+*.pdf.extracted/
+
 # Python bytecode
 __pycache__/
 *.pyc

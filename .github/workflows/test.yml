@@ -37,3 +37,35 @@ jobs:
         run: |
           uv run --python ${{ matrix.python-version }} \
             --script bin/kicad-extract.py --help
+
+  # pdf-sidecar tests — synthetic PDFs via reportlab, backends stubbed via
+  # monkeypatch of the BACKENDS dispatch table, so neither Marker nor Docling
+  # (and their torch dependencies) are installed in CI.
+  pdf-sidecar:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Run pytest (pdf-sidecar)
+        working-directory: pdf-sidecar
+        run: |
+          uv run --python ${{ matrix.python-version }} \
+            --with pytest --with pypdf --with reportlab \
+            pytest tests/ -v
+
+      - name: Smoke-test extractor --help (PEP 723 deps via uv run --script)
+        working-directory: pdf-sidecar
+        run: |
+          uv run --python ${{ matrix.python-version }} \
+            --script bin/pdf-sidecar.py --help
