@@ -67,6 +67,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -79,6 +80,12 @@ from pathlib import Path
 from typing import Callable
 
 import pypdf
+
+# pypdf is chatty on real-world PDFs (especially annotated ones from
+# Notability / preview / etc.) — "Ignoring wrong pointing object" warnings
+# can flood stderr without affecting extraction. Quiet it; the baseline
+# pass's job is to give us word + image counts, not to validate the file.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Versions
@@ -344,7 +351,6 @@ def extract_marker(pdf_path: Path, mode: str) -> BackendResult:
         from marker.converters.pdf import PdfConverter  # type: ignore
         from marker.models import create_model_dict  # type: ignore
         from marker.output import text_from_rendered  # type: ignore
-        import marker as _marker  # type: ignore
     except ImportError as exc:
         raise BackendFailure(
             "marker not available. Re-invoke with:\n"
@@ -360,13 +366,23 @@ def extract_marker(pdf_path: Path, mode: str) -> BackendResult:
         raise BackendFailure(f"marker crashed on {pdf_path}: {exc}") from exc
 
     image_blobs: list[tuple[str, bytes]] = []
+    # Map Marker's internal filenames → our renamed files. We rewrite the
+    # markdown so `![](_page_X_Picture_Y.jpeg)` becomes
+    # `![](images/figure-NNN.png)` and the links actually resolve.
+    name_map: dict[str, str] = {}
     if mode == "full" and images:
         import io
 
-        for idx, (_name, pil_image) in enumerate(sorted(images.items()), start=1):
+        for idx, (orig_name, pil_image) in enumerate(
+            sorted(images.items()), start=1
+        ):
+            new_name = f"figure-{idx:03d}.png"
+            name_map[orig_name] = new_name
             buf = io.BytesIO()
             pil_image.save(buf, format="PNG")
-            image_blobs.append((f"figure-{idx:03d}.png", buf.getvalue()))
+            image_blobs.append((new_name, buf.getvalue()))
+
+    text = _rewrite_image_refs(text, name_map, subdir="images")
 
     # Marker emits tables inline in markdown; we don't currently split them
     # into a separate tables/ dir from marker. (Docling will.)
@@ -375,8 +391,37 @@ def extract_marker(pdf_path: Path, mode: str) -> BackendResult:
         images=image_blobs,
         tables_md=[],
         backend_name="marker",
-        backend_version=getattr(_marker, "__version__", "unknown"),
+        backend_version=_pkg_version("marker-pdf"),
     )
+
+
+def _rewrite_image_refs(
+    markdown: str, name_map: dict[str, str], *, subdir: str
+) -> str:
+    """Replace `![](orig)` with `![](subdir/new)` for every mapping entry.
+
+    Marker emits image refs as `![](<filename>)` with no path prefix. We
+    rewrite them to point at our `images/` subdir AND to use our renamed
+    files. If no mapping is supplied (text-only mode), `markdown` is
+    returned unchanged.
+    """
+    if not name_map:
+        return markdown
+    for orig, new in name_map.items():
+        markdown = markdown.replace(f"]({orig})", f"]({subdir}/{new})")
+    return markdown
+
+
+def _pkg_version(dist_name: str) -> str:
+    """Best-effort installed-package version. Falls back to 'unknown'."""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            return version(dist_name)
+        except PackageNotFoundError:
+            return "unknown"
+    except Exception:
+        return "unknown"
 
 
 def extract_docling(pdf_path: Path, mode: str) -> BackendResult:
@@ -386,7 +431,6 @@ def extract_docling(pdf_path: Path, mode: str) -> BackendResult:
     """
     try:
         from docling.document_converter import DocumentConverter  # type: ignore
-        import docling as _docling  # type: ignore
     except ImportError as exc:
         raise BackendFailure(
             "docling not available. Re-invoke with:\n"
@@ -435,7 +479,7 @@ def extract_docling(pdf_path: Path, mode: str) -> BackendResult:
         images=image_blobs,
         tables_md=tables,
         backend_name="docling",
-        backend_version=getattr(_docling, "__version__", "unknown"),
+        backend_version=_pkg_version("docling"),
     )
 
 
@@ -520,7 +564,11 @@ def verify(
         image_ratio = actual_images / denom_img
         if image_ratio < image_ratio_ok and status != "fail":
             notes.append(
-                f"image_ratio {image_ratio:.2f} below ok threshold {image_ratio_ok:.2f}"
+                f"image_ratio {image_ratio:.2f} below {image_ratio_ok:.2f}: "
+                f"backend extracted {actual_images} figures, pypdf saw "
+                f"{expected_images} image XObjects in the source (note: pypdf "
+                f"counts every XObject including decorative bullets/rules, so "
+                f"this can be benign — inspect images/ to confirm)"
             )
             if status == "ok":
                 status = "warning"

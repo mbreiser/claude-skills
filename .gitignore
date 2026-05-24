@@ -8,7 +8,16 @@
 # pdf-sidecar extracted directories (live next to source PDFs)
 *.pdf.extracted/
 
+# Local test runs for pdf-sidecar (real-PDF extractions, not for VCS)
+.test-runs/
+
 # Python bytecode
 __pycache__/
 *.pyc
 *.pyo
+
+# Project-local Claude Code config (per-user, do not commit)
+.claude/
+
+# macOS
+.DS_Store
