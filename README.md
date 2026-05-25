@@ -26,6 +26,7 @@ ln -s "$(pwd)/codex-plan-review" ~/.claude/skills/codex-plan-review
 |---|---|
 | [codex-plan-review](codex-plan-review/) | GPT-5.5 second opinion on an implementation plan before code is written. Runs standard + adversarial reviews in parallel via the Codex CLI, reconciles against an independent Claude pass, surfaces agreements / disagreements / open questions. |
 | [codex-diff-review](codex-diff-review/) | GPT-5.5 second opinion on a code change (working-tree or branch diff) before commit or merge. Same parallel-reviews + reconciliation pattern as `codex-plan-review`, applied to written code. |
+| [codex-skill-review](codex-skill-review/) | GPT-5.5 second opinion on an already-drafted Claude Code skill — description trigger quality, workflow ergonomics, `bin/` robustness, sibling overlap, whether the skill earns its place in the suite. Same parallel-reviews + reconciliation pattern, applied to skills themselves. |
 | [instruments](instruments/) | Control Digilent Analog Discovery 3 (AD3) and Saleae Logic Pro 8 test instruments via Python. Capture waveforms, generate trigger/stimulus signals, analyze oscilloscope / logic-analyzer traces. |
 | [nano-banana-artwork](nano-banana-artwork/) | Generate consistent character artwork via Google's Nano Banana Pro (gemini-3-pro-image-preview). Themed posters, logos, character sets with cross-image consistency. |
 | [kicad-design-review](kicad-design-review/) | KiCad PCB schematic review. Python extractor produces deterministic structured facts (BOM × netlist × schematic × positions, with confidence flags); skill synthesizes the human-readable design-review report. |
@@ -33,7 +34,7 @@ ln -s "$(pwd)/codex-plan-review" ~/.claude/skills/codex-plan-review
 
 ## Dependencies
 
-- **codex-plan-review** / **codex-diff-review** require [Codex CLI](https://github.com/anthropics/codex) (`brew install codex` or follow the upstream install).
+- **codex-plan-review** / **codex-diff-review** / **codex-skill-review** require [Codex CLI](https://github.com/anthropics/codex) (`brew install codex` or follow the upstream install) and `jq` (for orchestrator metadata).
 - **instruments** requires Digilent Waveforms SDK (AD3) and/or Saleae Logic 2 (Saleae). Python 3.14 on macOS for AD3.
 - **kicad-design-review** requires Python 3.10+ and `kiutils` (installed via `pyproject.toml` in the skill directory).
 - **nano-banana-artwork** requires a Google AI Studio API key (`GOOGLE_GENAI_API_KEY`).
