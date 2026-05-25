@@ -40,7 +40,7 @@ Read the target skill's `SKILL.md`. Read any `bin/` scripts it includes. Skim th
 
 ### Step 2 — Write your independent review (BEFORE running Codex)
 
-Save your own review to `.codex-review/claude-analysis.md` **before** launching the orchestrator. Same structure as Codex's prompts: description trigger quality, workflow ergonomics, `bin/` script robustness, fit with sibling skills, failure-mode documentation; plus an adversarial pass (does this skill solve a real problem? discoverability false positives/negatives? overlap with existing skills? maintenance cost? strongest argument against shipping?).
+Save your own review to `.codex-review/claude-analysis-<timestamp>.md` (use any unique timestamp like `YYYYMMDD-HHMMSS`, so back-to-back runs don't clobber prior analyses) **before** launching the orchestrator. Same structure as Codex's prompts: description trigger quality, workflow ergonomics, `bin/` script robustness, fit with sibling skills, failure-mode documentation; plus an adversarial pass (does this skill solve a real problem? discoverability false positives/negatives? overlap with existing skills? maintenance cost? strongest argument against shipping?).
 
 Author bias is real when reviewing a skill you (or your sibling agent) just wrote. Try to evaluate as if it landed in the repo from someone else. The file checkpoint exists so you commit to your view before reading Codex.
 
@@ -130,7 +130,7 @@ When Claude and Codex disagree, present Codex's view at least as fully as your o
 
 ## 5. Raw outputs
 
-- Claude's analysis: `.codex-review/claude-analysis.md`
+- Claude's analysis: `.codex-review/claude-analysis-<ts>.md` (timestamp set in Step 2)
 - Codex standard: `<standard_md from meta.json>`
 - Codex adversarial: `<adversarial_md from meta.json>`
 - Per-run index: `<meta.json path>`

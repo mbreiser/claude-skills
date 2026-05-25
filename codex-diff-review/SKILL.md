@@ -55,7 +55,7 @@ Run `git diff <base-ref>` (or `git diff --staged` / `git diff HEAD`, matching th
 
 ### Step 2 — Write your independent review (BEFORE running Codex)
 
-Save your own review of the diff to `.codex-review/claude-analysis.md` **before** launching the orchestrator. Same structure as Codex's prompts: correctness, tests, fit, risk and reliability, suggested changes, grouped by severity (blocking / significant / minor); plus an adversarial pass (right approach? assumptions? failure modes? hidden costs? reversibility? races/data loss? strongest argument against merging?).
+Save your own review of the diff to `.codex-review/claude-analysis-<timestamp>.md` (use any unique timestamp like `YYYYMMDD-HHMMSS`, so back-to-back runs don't clobber prior analyses) **before** launching the orchestrator. Same structure as Codex's prompts: correctness, tests, fit, risk and reliability, suggested changes, grouped by severity (blocking / significant / minor); plus an adversarial pass (right approach? assumptions? failure modes? hidden costs? reversibility? races/data loss? strongest argument against merging?).
 
 Author bias on code is even stronger than on plans — try to review as if seeing it for the first time. The file checkpoint exists so you commit to your view before reading Codex.
 
@@ -145,7 +145,7 @@ When Claude and Codex disagree, present Codex's view at least as fully as your o
 
 ## 5. Raw outputs
 
-- Claude's analysis: `.codex-review/claude-analysis.md`
+- Claude's analysis: `.codex-review/claude-analysis-<ts>.md` (timestamp set in Step 2)
 - Codex standard: `<standard_md from meta.json>`
 - Codex adversarial: `<adversarial_md from meta.json>`
 - Diff: `<diff_path from meta.json>`

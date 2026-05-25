@@ -39,7 +39,7 @@ If the plan is already in a file, note its path. Otherwise write it to `.codex-r
 
 ### Step 2 — Write your independent review (BEFORE running Codex)
 
-This is a soft commitment device. Save your own review to `.codex-review/claude-analysis.md` **before** launching the orchestrator. Structure it the same way the prompts ask Codex for: correctness / completeness / fit / risk / suggested changes, plus an adversarial pass (right approach? assumptions? failure modes? hidden costs? reversibility? strongest argument against?).
+This is a soft commitment device. Save your own review to `.codex-review/claude-analysis-<timestamp>.md` (use any unique timestamp like `YYYYMMDD-HHMMSS`, so back-to-back runs don't clobber prior analyses) **before** launching the orchestrator. Structure it the same way the prompts ask Codex for: correctness / completeness / fit / risk / suggested changes, plus an adversarial pass (right approach? assumptions? failure modes? hidden costs? reversibility? strongest argument against?).
 
 Author bias on the plan is real, especially when you wrote it. Try to review as if seeing it for the first time. The file is the checkpoint — once you commit to it on disk, don't go back and rewrite after reading Codex.
 
@@ -121,7 +121,7 @@ When you and Codex disagree on a substantive technical point, do not default to 
 
 ## 5. Raw outputs
 
-- Claude's analysis: `.codex-review/claude-analysis.md`
+- Claude's analysis: `.codex-review/claude-analysis-<ts>.md` (timestamp set in Step 2)
 - Codex standard: `<standard_md from meta.json>`
 - Codex adversarial: `<adversarial_md from meta.json>`
 - Per-run index: `<meta.json path>`
