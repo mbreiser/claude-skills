@@ -11,66 +11,70 @@ Get a GPT-5.5 second opinion on an implementation plan, then reconcile it with y
 
 The user wants outside-model feedback on a plan or design **before** code is written. Triggers include "Codex second opinion," "cross-check this design," "sanity-check the approach," "pressure-test this plan." If code already exists, use `codex-diff-review` instead.
 
-## What "the plan" is
+## Reducing permission prompts (one-time setup)
 
-Whatever document or set of bullet points is on the table — a markdown file the user wrote, a plan you just produced in this conversation, a spec they pasted, or a goal + proposed approach. If it's not already in a file, write it to `.codex-review/plan-<timestamp>.md` at the repo root before invoking Codex. `codex exec` reads its prompt from the command line and the working tree from `cwd`; pointing it at a file avoids quoting issues.
+A fresh run triggers 3–4 permission prompts: the `claude-analysis.md` write (Step 2), the orchestrator bash call (Step 3), the final report write (Step 5), and optionally a staging write if the plan isn't already in a file (Step 1). All four go to zero if these entries are added to `~/.claude/settings.json` (apply via `/permissions` or by editing the file):
+
+```jsonc
+{
+  "permissions": {
+    "allow": [
+      "Bash(codex --version)",
+      "Bash(bash *codex-plan-review/bin/run-review.sh *)",
+      "Bash(bash *codex-diff-review/bin/run-review.sh *)",
+      "Read(./.codex-review/**)",
+      "Write(./.codex-review/**)"
+    ]
+  }
+}
+```
+
+This is opt-in: do not modify the user's settings on the user's behalf. Mention the snippet if the user complains about prompt churn.
 
 ## Workflow
 
 ### Step 1 — Stage the plan
 
-Note the file path if it exists. Otherwise write the plan to `.codex-review/plan-<timestamp>.md`. Ensure `.codex-review/` is in `.gitignore`.
+If the plan is already in a file, note its path. Otherwise write it to `.codex-review/plan-<timestamp>.md` at the repo root. `.codex-review/` should already be in `.gitignore` (sibling skills assume this; check if unsure).
 
-### Step 2 — Confirm Codex is set up
+### Step 2 — Write your independent review (BEFORE running Codex)
 
-Run `codex --version`. If it fails, tell the user and stop — don't install without permission.
+This is a soft commitment device. Save your own review to `.codex-review/claude-analysis.md` **before** launching the orchestrator. Structure it the same way the prompts ask Codex for: correctness / completeness / fit / risk / suggested changes, plus an adversarial pass (right approach? assumptions? failure modes? hidden costs? reversibility? strongest argument against?).
 
-### Step 3 — Launch both reviews in parallel
+Author bias on the plan is real, especially when you wrote it. Try to review as if seeing it for the first time. The file is the checkpoint — once you commit to it on disk, don't go back and rewrite after reading Codex.
 
-Write the two prompts (templates below) to `.codex-review/standard-prompt.txt` and `.codex-review/adversarial-prompt.txt` with `{PLAN_PATH}` substituted. Then:
+### Step 3 — Run the orchestrator
 
 ```bash
-codex exec \
-  --sandbox read-only \
-  --model gpt-5.5 \
-  -c model_reasoning_effort='"high"' \
-  --json \
-  "$(cat .codex-review/standard-prompt.txt)" \
-  > .codex-review/standard-output.jsonl 2>&1 &
-
-codex exec \
-  --sandbox read-only \
-  --model gpt-5.5 \
-  -c model_reasoning_effort='"high"' \
-  --json \
-  "$(cat .codex-review/adversarial-prompt.txt)" \
-  > .codex-review/adversarial-output.jsonl 2>&1 &
+bash codex-plan-review/bin/run-review.sh <plan-path>
 ```
 
-If `--model gpt-5.5` fails (account doesn't have access), fall back to `gpt-5.4` and tell the user. Don't silently downgrade.
+The script runs two `codex exec` passes (standard + adversarial) in parallel with `--output-last-message`, applies a wall-clock timeout (default 600s), traps SIGINT to clean up children, and emits a `meta.json` index. It prints the meta.json path to stdout.
 
-### Step 4 — Write your own analysis (in parallel with Codex)
+Environment overrides:
+- `CODEX_REVIEW_MODEL` — pin a model (defaults to `gpt-5.5`); use this if `gpt-5.5` is unavailable on the user's account.
+- `CODEX_REVIEW_TIMEOUT` — seconds per pass (default 600).
 
-While Codex runs, produce **your own** review structured the same way the prompts ask for. Don't peek at Codex output before completing your own pass — independence matters. Save to `.codex-review/claude-analysis.md`.
+Exit codes: `0` both passes succeeded, `1` exactly one failed (proceed with the survivor), `2` setup failure (codex CLI missing, plan unreadable), `3` both failed (stop and report), `130` interrupted.
 
-### Step 5 — Wait for Codex, parse outputs
+### Step 4 — Read the outputs
 
-Wait for both background jobs. Parse the final assistant message from each `.jsonl` stream. If either run failed (non-zero exit, error event, timeout > 10 min), report the failure — do not fabricate output. You can still reconcile with one Codex review + your analysis, but flag the missing piece.
+Read `meta.json`, then the `standard_md` and `adversarial_md` files it names. The JSONL streams are kept as provenance but you should not need to parse them — `--output-last-message` already extracts the final assistant message into `.md`.
 
-### Step 6 — Reconcile
+If a pass failed (`std_rc != 0` or `adv_rc != 0`), say so in the final report rather than fabricating output. You can still reconcile with one Codex review plus your analysis, but flag the missing piece explicitly.
 
-Use the output template below. Reasoning rules:
+### Step 5 — Reconcile and write the final report
+
+Use the output format below. Save to `.codex-review/report-<timestamp>.md` and present inline. **Do not modify the plan.**
+
+Reasoning rules:
 
 - **Agreement** = at least two of the three sources flagged the same issue. Note which.
 - **Disagreement** = Codex (one or both) raised something Claude didn't, OR contradicted Claude. Both directions.
 - **Codex internal disagreement** = standard and adversarial point in different directions on the same point. *Articulate the tradeoff* rather than picking a side — this category usually marks real design tradeoffs.
 - **Open questions** = depend on context none of the three had: user intent, hardware specifics, downstream consumers, prior decisions.
 
-When you and Codex disagree on a substantive technical point, do not default to defending your original view. Lean toward presenting Codex's view fairly — you have author bias on the plan, Codex doesn't.
-
-### Step 7 — Present the report
-
-Write the report inline to the conversation. Save to `.codex-review/report-<timestamp>.md`. **Do not modify the plan.**
+When you and Codex disagree on a substantive technical point, do not default to defending your original view. Lean toward presenting Codex's view fairly — you have author bias on the plan, Codex does not.
 
 ## Output format
 
@@ -118,61 +122,12 @@ Write the report inline to the conversation. Save to `.codex-review/report-<time
 ## 5. Raw outputs
 
 - Claude's analysis: `.codex-review/claude-analysis.md`
-- Codex standard: `.codex-review/standard-output.jsonl`
-- Codex adversarial: `.codex-review/adversarial-output.jsonl`
+- Codex standard: `<standard_md from meta.json>`
+- Codex adversarial: `<adversarial_md from meta.json>`
+- Per-run index: `<meta.json path>`
 ````
 
 Empty sections keep the header with `*(none)*` underneath. Empty sections are signal too.
-
-## Standard plan review prompt (substitute `{PLAN_PATH}`)
-
-```
-You are reviewing an implementation plan for code that has not yet been written. The plan is at `{PLAN_PATH}` (relative to the current working directory). The repository the plan applies to is the current working directory; you have read-only access.
-
-Read the plan carefully. Then read enough of the existing repository to understand context — directory structure, files the plan names explicitly, surrounding code the plan would touch.
-
-Produce a focused review covering:
-
-1. **Correctness of the proposed approach.** Will the plan, if implemented as described, achieve the stated goal? Logical errors? Incorrect assumptions about libraries / APIs / hardware? Missing steps?
-
-2. **Completeness.** What's missing that a careful implementer would need? Edge cases not addressed? Failure modes not handled? Tests not specified?
-
-3. **Fit with the existing codebase.** Does the plan respect conventions, patterns, and constraints of the code it would live in? Duplicates work done elsewhere? Conflicts with anything?
-
-4. **Risk areas.** Anything likely to cause subtle bugs, performance problems, or maintenance pain later? Be specific — "concurrency is hard" is not useful; "the proposed lock ordering can deadlock if X and Y are called from different threads" is.
-
-5. **Specific suggested changes.** Concrete, actionable items.
-
-Format as markdown with these five sections as level-2 headers. Reference specific file paths or line numbers from existing code where relevant. Be direct and specific. Avoid hedging language.
-
-If the plan is genuinely good and you have little to add, say so explicitly rather than padding.
-```
-
-## Adversarial plan review prompt (substitute `{PLAN_PATH}`)
-
-```
-You are reviewing an implementation plan adversarially. Your job is to pressure-test the *design choice itself*, not to find bugs in the proposed steps. The plan is at `{PLAN_PATH}` (relative to the current working directory); the repository it applies to is the current working directory, read-only.
-
-A standard reviewer asks "does this plan correctly do the thing it sets out to do?" — that's not your job. Your job is "is this the right thing to do at all?"
-
-Read the plan and enough surrounding code for context. Then produce a review covering:
-
-1. **Is the chosen approach the right one?** What alternatives exist? Why might one be better? Be concrete: name the alternative, explain when it would win, what the current plan trades away by not choosing it.
-
-2. **What assumptions is the plan making, and which might be wrong?** List the load-bearing ones. For each: what happens if it's wrong? How would we even know it's wrong?
-
-3. **Failure modes the plan doesn't address.** Failure modes of the *design*, not bugs. What at 10x or 100x scale? Dependency unavailable? Inputs malformed in unanticipated ways? Multiple of these at once?
-
-4. **Hidden costs.** Maintenance burden, debugging difficulty, performance ceiling, lock-in, opportunity cost of *not* doing something else.
-
-5. **Reversibility.** If wrong six months from now, how hard to undo? One-way door? If so, is it being treated like one?
-
-6. **The strongest argument against this plan.** Spend at least a few sentences making the strongest case against. Steelman the opposition. If you can't make a compelling case against, say so — that's signal.
-
-Format as markdown with these six sections as level-2 headers. Be direct. Avoid politeness inflation — soft adversarial review is worse than none.
-
-If after honest pressure-testing the plan is sound, say so. Adversarial reviewing isn't about always finding fault; it's about always *trying* to, and being honest about what you find.
-```
 
 ## Failure modes to avoid
 
@@ -181,3 +136,4 @@ If after honest pressure-testing the plan is sound, say so. Adversarial reviewin
 - **Don't skip your own analysis.** Two voices collapses into Codex summary.
 - **Don't hide disagreements.** Author bias is real; flag rather than smooth.
 - **Don't fabricate Codex output.** Failed run? Say so.
+- **Don't write claude-analysis.md after reading Codex.** Independence requires committing to your view before peeking.

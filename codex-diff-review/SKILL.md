@@ -11,68 +11,79 @@ Get a GPT-5.5 second opinion on a code change, then reconcile it with your own a
 
 The user wants outside-model feedback on **already-written code** — staged changes, unstaged working tree, or branch diff. Triggers include "Codex review the diff," "cross-check before I commit," "pre-commit second opinion," "pressure-test what I just implemented." If no code exists yet, use `codex-plan-review` instead.
 
+## Reducing permission prompts (one-time setup)
+
+A fresh run triggers 2–4 permission prompts: the `claude-analysis.md` write (Step 2), the orchestrator bash call (Step 3), the final report write (Step 4), and possibly a `git diff` Bash call in Step 1 if you choose to read the diff before writing analysis. All go to zero if these entries are added to `~/.claude/settings.json` (apply via `/permissions` or by editing the file):
+
+```jsonc
+{
+  "permissions": {
+    "allow": [
+      "Bash(codex --version)",
+      "Bash(bash *codex-plan-review/bin/run-review.sh *)",
+      "Bash(bash *codex-diff-review/bin/run-review.sh *)",
+      "Read(./.codex-review/**)",
+      "Write(./.codex-review/**)"
+    ]
+  }
+}
+```
+
+This is opt-in: do not modify the user's settings on the user's behalf. Mention the snippet if the user complains about prompt churn.
+
 ## Defining "the diff"
 
-Ask one targeted question if ambiguous, otherwise infer:
+Ask one targeted question if ambiguous, otherwise infer. The orchestrator's first argument selects the diff source:
 
-- "review what I just did" / context implies recent work → `git diff HEAD` or `git diff <branch>...HEAD`
-- "against main" → `git diff main...HEAD`
-- Named base ref → `git diff <ref>...HEAD`
-- Staged but uncommitted → `git diff --staged`
+| User intent | Argument |
+|---|---|
+| "review what I just did" / against branch base | `<base-ref>` (e.g., `main`, `develop`, `HEAD~3`) → `git diff <ref>...HEAD` |
+| "review staged changes" | `--staged` → `git diff --staged` |
+| "review my working tree" | `--working` → `git diff HEAD` (working tree vs HEAD; **includes both staged and unstaged**) |
 
-Save the diff to `.codex-review/diff-<timestamp>.patch` and changed files list to `.codex-review/files.txt`. If diff is empty, stop.
+If the resulting diff is empty, the orchestrator exits with code 2 and a clear message.
+
+**Untracked files note:** `git diff` doesn't show untracked files. If the review should cover new files in the working tree, run `git add -N <paths>` (intent-to-add) first — that makes them appear in `git diff HEAD` as additions without actually staging the content.
+
+**Large diffs:** the orchestrator does not pre-screen size; it runs whatever diff you point it at. If you know the diff is huge (thousands of lines) and want to chunk by file group before paying for two full Codex passes, run `git diff <ref> --stat` yourself first and decide. The orchestrator's `meta.json` reports `diff_lines` and `file_count` after the fact for the final report.
 
 ## Workflow
 
-### Step 1 — Stage the diff
+### Step 1 — See the diff yourself
 
-Run `git diff`, write to patch file, capture file list. Ensure `.codex-review/` is in `.gitignore`.
+Run `git diff <base-ref>` (or `git diff --staged` / `git diff HEAD`, matching the argument you'll pass to the orchestrator) so you can read what's actually changed. You can't write a meaningful independent review of a diff you haven't seen, and the orchestrator's `diff.patch` doesn't exist until after Step 3 finishes.
 
-### Step 2 — Size check
+### Step 2 — Write your independent review (BEFORE running Codex)
 
-- **< 1000 changed lines** — review whole diff in one shot.
-- **1000–5000** — same, but warn the user about time and token cost.
-- **> 5000** — chunk by file group (directory or logical area). Run all standard chunks in parallel, all adversarial chunks in parallel, then aggregate before reconciling. Tell the user.
+Save your own review of the diff to `.codex-review/claude-analysis.md` **before** launching the orchestrator. Same structure as Codex's prompts: correctness, tests, fit, risk and reliability, suggested changes, grouped by severity (blocking / significant / minor); plus an adversarial pass (right approach? assumptions? failure modes? hidden costs? reversibility? races/data loss? strongest argument against merging?).
 
-### Step 3 — Confirm Codex is set up
+Author bias on code is even stronger than on plans — try to review as if seeing it for the first time. The file checkpoint exists so you commit to your view before reading Codex.
 
-Run `codex --version`. If it fails, tell the user and stop.
-
-### Step 4 — Launch both reviews in parallel
-
-Write the prompts (templates below) to `.codex-review/standard-prompt.txt` and `.codex-review/adversarial-prompt.txt` with `{DIFF_PATH}`, `{BASE_REF}`, `{FILES}` substituted. Then:
+### Step 3 — Run the orchestrator
 
 ```bash
-codex exec \
-  --sandbox read-only \
-  --model gpt-5.5 \
-  -c model_reasoning_effort='"high"' \
-  --json \
-  "$(cat .codex-review/standard-prompt.txt)" \
-  > .codex-review/standard-output.jsonl 2>&1 &
-
-codex exec \
-  --sandbox read-only \
-  --model gpt-5.5 \
-  -c model_reasoning_effort='"high"' \
-  --json \
-  "$(cat .codex-review/adversarial-prompt.txt)" \
-  > .codex-review/adversarial-output.jsonl 2>&1 &
+bash codex-diff-review/bin/run-review.sh <base-ref|--staged|--working>
 ```
 
-Codex inherits the working directory and reads source files for context as needed. `--sandbox read-only` prevents modifications. If `--model gpt-5.5` fails, fall back to `gpt-5.4` and tell the user.
+The script captures the diff via `git diff`, writes it to a per-run directory, then runs two `codex exec` passes (standard + adversarial) in parallel with `--output-last-message`, applies a wall-clock timeout (default 600s), traps SIGINT to clean up children, and emits a `meta.json` index. It prints the meta.json path to stdout.
 
-### Step 5 — Write your own review (in parallel)
+Environment overrides:
+- `CODEX_REVIEW_MODEL` — pin a model (defaults to `gpt-5.5`); use this if `gpt-5.5` is unavailable on the user's account.
+- `CODEX_REVIEW_TIMEOUT` — seconds per pass (default 600; must be a positive integer).
 
-Produce your own review of the diff before peeking at Codex output. Save to `.codex-review/claude-analysis.md`. Author bias on code is even stronger than on plans — counteract deliberately. Try to review as if seeing it for the first time.
+Exit codes: `0` both passes succeeded, `1` exactly one failed (proceed with the survivor), `2` setup failure (codex CLI missing, not in a git repo, empty diff, bad timeout), `3` both failed (stop and report), `130` interrupted.
 
-### Step 6 — Wait for Codex, parse outputs
+### Step 4 — Read the outputs
 
-Wait for both background jobs. Parse final assistant messages from each `.jsonl`. Failed run? Report it, don't fabricate. Proceed with one + your analysis if needed, flagging the missing piece.
+Read `meta.json`, then the `standard_md` and `adversarial_md` files it names. The JSONL streams are kept as provenance but you should not need to parse them — `--output-last-message` already extracts the final assistant message into `.md`.
 
-### Step 7 — Reconcile
+If a pass failed (`std_rc != 0` or `adv_rc != 0`), say so in the final report rather than fabricating output. You can still reconcile with one Codex review plus your analysis, but flag the missing piece explicitly.
 
-Use the output template below. Reasoning rules:
+### Step 5 — Reconcile and write the final report
+
+Use the output format below. Save to `.codex-review/report-<timestamp>.md` and present inline. **Do not modify the code.**
+
+Reasoning rules:
 
 - **Agreement** = at least two of three flagged the same issue. Highest confidence.
 - **Disagreement** = Codex raised what Claude didn't, or contradicted Claude.
@@ -82,16 +93,12 @@ Use the output template below. Reasoning rules:
 
 When Claude and Codex disagree, present Codex's view at least as fully as your own.
 
-### Step 8 — Present the report
-
-Write inline. Save to `.codex-review/report-<timestamp>.md`. **Do not modify the code.**
-
 ## Output format
 
 ````markdown
 # Codex Cross-Review: <short diff description>
 
-**Diff:** `<base>...HEAD` (<N> files, +<additions>/-<deletions>)
+**Diff:** `<diff_desc>` (<N> files, <diff_lines> lines)
 **Reviewed by:** Claude (independent), Codex GPT-5.5 standard, Codex GPT-5.5 adversarial
 **Date:** <ISO date>
 
@@ -139,70 +146,13 @@ Write inline. Save to `.codex-review/report-<timestamp>.md`. **Do not modify the
 ## 5. Raw outputs
 
 - Claude's analysis: `.codex-review/claude-analysis.md`
-- Codex standard: `.codex-review/standard-output.jsonl`
-- Codex adversarial: `.codex-review/adversarial-output.jsonl`
-- Diff: `.codex-review/diff-<timestamp>.patch`
+- Codex standard: `<standard_md from meta.json>`
+- Codex adversarial: `<adversarial_md from meta.json>`
+- Diff: `<diff_path from meta.json>`
+- Per-run index: `<meta.json path>`
 ````
 
 Empty sections keep the header with `*(none)*` underneath.
-
-## Standard diff review prompt (substitute `{DIFF_PATH}`, `{BASE_REF}`, `{FILES}`)
-
-```
-You are reviewing a code change. The diff is at `{DIFF_PATH}` (relative to the current working directory) and represents `{BASE_REF}...HEAD`. Changed files are listed in `{FILES}`. The repository is the current working directory; you have read-only access and can read any file you need for context.
-
-Read the diff. Then read surrounding code in each changed file — a diff in isolation is rarely enough.
-
-Produce a focused review covering:
-
-1. **Correctness.** Bugs? Logic errors? Off-by-ones? Incorrect API usage? Race conditions? Unhandled error paths? Cite file paths and line numbers.
-
-2. **Tests.** Adequate for what changed? Untested changes? Tests passing for the wrong reason? Missing edge cases?
-
-3. **Fit with existing code.** Conventions and patterns respected? Duplicates functionality elsewhere? Dead code, unused imports, stale comments?
-
-4. **Risk and reliability.** Performance regressions, memory issues, security concerns, operational risks? Pay attention to error handling, resource cleanup, input validation, concurrency, external-dependency assumptions.
-
-5. **Specific suggested changes.** Concrete, actionable items with locations.
-
-Format as markdown with these five sections as level-2 headers. Within each section, group items by severity:
-
-- **Blocking** — correctness, security, data loss, anything that should not ship.
-- **Significant** — subtle bugs, design concerns, maintainability.
-- **Minor** — style, naming, small cleanups.
-
-Cite specific file paths and line numbers (`path/to/file.ext:42`). Be direct. Avoid hedging.
-
-If the change is genuinely good, say so. Don't manufacture nits to look thorough.
-```
-
-## Adversarial diff review prompt (substitute `{DIFF_PATH}`, `{BASE_REF}`, `{FILES}`)
-
-```
-You are reviewing a code change adversarially. Your job is to pressure-test the *design and approach*, not just to find bugs in lines. The diff is at `{DIFF_PATH}` representing `{BASE_REF}...HEAD`. Changed files are listed in `{FILES}`. The repository is the current working directory, read-only.
-
-A standard reviewer asks "is this code correct?" — that's not your job. Your job is "should this code exist in this form?"
-
-Read the diff and surrounding code in each changed file. Then produce a review covering:
-
-1. **Was this the right approach?** Alternative implementations? Why might one be better? Be concrete: name the alternative, when it would win, what the current implementation trades away.
-
-2. **What assumptions does this code make, and which might be wrong?** Inputs, callers, downstream consumers, environment, hardware, runtime. Load-bearing ones. For each: what if it's wrong? How would we know?
-
-3. **Failure modes the code doesn't address.** Failure modes of the *design*, not just untested branches. 10x or 100x scale? Partial failure of dependencies? Adversarial or malformed inputs? Multiple at once?
-
-4. **Hidden costs.** Maintenance burden, debugging difficulty, performance ceiling, coupling, lock-in. Cite locations.
-
-5. **Reversibility.** Wrong six months from now — how hard to undo? Public APIs added, schema changes, persisted state formats — one-way doors? Treated like one?
-
-6. **Race conditions, data-loss risks, rollback risks, reliability risks.** Specifically named so you don't skip them. Concurrency bugs hide well; look harder than you think.
-
-7. **The strongest argument against merging.** Spend a few sentences making the strongest case against. Steelman the opposition. If you can't, say so — that's information.
-
-Format as markdown with these seven sections as level-2 headers. Cite specific paths and line numbers. Be direct. Avoid politeness inflation.
-
-If after honest pressure-testing the change is sound, say so plainly.
-```
 
 ## Failure modes to avoid
 
@@ -212,3 +162,4 @@ If after honest pressure-testing the change is sound, say so plainly.
 - **Don't bury blocking issues.** Correctness or security flagged anywhere → top of section 1 or 2 with explicit "Blocking" tagging.
 - **Don't fabricate Codex output.** Failed run? Say so.
 - **Don't dismiss Codex on "it doesn't have context."** Say "here's what Codex said, here's the context that may change the picture" — not silent omission.
+- **Don't write claude-analysis.md after reading Codex.** Independence requires committing to your view before peeking.
