@@ -36,16 +36,18 @@ def _status_dict(st: StripStatus) -> dict:
 
 
 def _print_status(st: StripStatus) -> None:
-    print(f"{st.name}  {st.model}  {st.host}  mac {st.mac}  fw {st.fw_ver.split()[0]}  rssi {st.rssi} dBm")
+    volts = [o.voltage_v for o in st.outlets if o.voltage_v]
+    mains = f"  mains {sum(volts) / len(volts):.1f} V" if volts else ""
+    print(f"{st.name}  {st.model}  {st.host}  mac {st.mac}  fw {st.fw_ver.split()[0]}  rssi {st.rssi} dBm{mains}")
     width = max([len(o.name) for o in st.outlets] + [4])
-    print(f" #  {'name':<{width}}  state  power_W  today_Wh  month_Wh  since_change")
+    print(f" #  {'name':<{width}}  state  power_W  current_mA  today_Wh  month_Wh  since_change")
     for o in st.outlets:
         state = "on" if o.on else "off"
         print(
-            f" {o.position}  {o.name:<{width}}  {state:<5}  {o.power_w:>7.0f}  "
+            f" {o.position}  {o.name:<{width}}  {state:<5}  {o.power_w:>7.1f}  {o.current_a * 1000:>10.0f}  "
             f"{o.today_wh:>8}  {o.month_wh:>8}  {_duration(o.on_time_s):>12}"
         )
-    print(f"    {'total':<{width}}         {st.total_w:>7.0f}")
+    print(f"    {'total':<{width}}         {st.total_w:>7.1f}")
 
 
 def _open_strip(args, cfg: Config) -> Strip:
@@ -160,18 +162,18 @@ def cmd_cycle(args, cfg):
         if args.json:
             _print_json({"strip": s.name, "position": pos, "state": "on", "power_w": w})
         else:
-            print(f"Outlet {pos} back on" + (f", drawing {w:.0f} W" if w is not None else ""))
+            print(f"Outlet {pos} back on" + (f", drawing {w:.1f} W" if w is not None else ""))
 
 
 def cmd_power(args, cfg):
     with _open_strip(args, cfg) as s:
         w = s.power(args.outlet)
-    _print_json({"outlet": args.outlet, "power_w": w}) if args.json else print(f"{w:.0f}")
+    _print_json({"outlet": args.outlet, "power_w": w}) if args.json else print(f"{w:.3f}")
 
 
 def _live_line(rows: list[OutletStatus]) -> None:
-    parts = "  ".join(f"{o.name}={o.power_w:.0f}W" for o in rows)
-    print(f"\r{parts}  total={sum(o.power_w for o in rows):.0f}W ", end="", file=sys.stderr, flush=True)
+    parts = "  ".join(f"{o.name}={o.power_w:.1f}W" for o in rows)
+    print(f"\r{parts}  total={sum(o.power_w for o in rows):.1f}W ", end="", file=sys.stderr, flush=True)
 
 
 def cmd_log(args, cfg):
@@ -195,7 +197,7 @@ def cmd_log(args, cfg):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tapo-power",
-        description="Local control and power monitoring for Tapo P316M/P304M power strips.",
+        description="Local control and power/voltage/current monitoring for Tapo P316M/P304M power strips.",
     )
     p.add_argument("--strip", help="configured strip name (default: the config's default strip)")
     p.add_argument("--host", help="talk to this IP directly instead of a configured strip")
@@ -227,7 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("email")
     s.set_defaults(fn=cmd_login)
 
-    s = sub.add_parser("status", help="per-outlet state, power, and energy")
+    s = sub.add_parser("status", help="per-outlet state, power, current, and energy")
     s.set_defaults(fn=cmd_status)
 
     for name, fn in (("on", cmd_on), ("off", cmd_off)):
@@ -242,11 +244,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--timeout-s", type=float, default=60.0, help="limit for --wait-above-w (default 60)")
     s.set_defaults(fn=cmd_cycle)
 
-    s = sub.add_parser("power", help="print one outlet's current draw in watts")
+    s = sub.add_parser("power", help="print one outlet's real power draw in watts")
     s.add_argument("outlet")
     s.set_defaults(fn=cmd_power)
 
-    s = sub.add_parser("log", help="log per-outlet power to CSV (stdout if --out is omitted)")
+    s = sub.add_parser("log", help="log per-outlet power, voltage, current to CSV (stdout if --out is omitted)")
     s.add_argument("--out", help="CSV file to append to")
     s.add_argument("--interval-s", type=float, default=1.0)
     s.add_argument("--duration-s", type=float, help="stop after this long (default: until Ctrl-C)")

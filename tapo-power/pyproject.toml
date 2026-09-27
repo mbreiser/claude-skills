@@ -1,10 +1,10 @@
 [project]
 name = "tapo-power"
-version = "0.1.0"
-description = "Local control and power monitoring for TP-Link Tapo P316M / P304M smart power strips"
+version = "0.2.0"
+description = "Local control and power/voltage/current monitoring for TP-Link Tapo P316M / P304M smart power strips"
 requires-python = ">=3.11"
 dependencies = [
-    "tapo>=0.9,<0.10",
+    "python-kasa>=0.10,<0.11",
     "keyring>=25",
 ]
 

@@ -11,11 +11,6 @@ CONFIG_PATH = Path(
 
 KEYRING_SERVICE = "tapo-power"
 
-# Strips onboarded via Matter only (no TP-Link account owner) accept TP-Link's
-# factory-default KLAP credentials. Once bound to an account, only that
-# account's credentials work.
-FACTORY_CREDENTIALS = ("test@tp-link.net", "test")
-
 
 class TapoPowerError(Exception):
     pass
@@ -78,17 +73,16 @@ class Config:
             raise TapoPowerError(f"Unknown strip {name!r} (configured: {known})") from None
 
 
-def credentials(account: str | None) -> list[tuple[str, str]]:
-    """Credentials to try, in order: the stored TP-Link account, then factory default."""
-    creds = []
-    if account:
-        import keyring
+def credentials(account: str | None) -> tuple[str, str] | None:
+    """The stored TP-Link account, or None. Strips onboarded via Matter only (no
+    account owner) accept TP-Link's factory-default credentials, which
+    python-kasa falls back to on its own."""
+    if not account:
+        return None
+    import keyring
 
-        password = keyring.get_password(KEYRING_SERVICE, account)
-        if password:
-            creds.append((account, password))
-    creds.append(FACTORY_CREDENTIALS)
-    return creds
+    password = keyring.get_password(KEYRING_SERVICE, account)
+    return (account, password) if password else None
 
 
 def store_password(account: str, password: str) -> None:

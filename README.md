@@ -31,7 +31,7 @@ ln -s "$(pwd)/codex-plan-review" ~/.claude/skills/codex-plan-review
 | [nano-banana-artwork](nano-banana-artwork/) | Generate consistent character artwork via Google's Nano Banana Pro (gemini-3-pro-image-preview). Themed posters, logos, character sets with cross-image consistency. |
 | [kicad-design-review](kicad-design-review/) | KiCad PCB schematic review. Python extractor produces deterministic structured facts (BOM × netlist × schematic × positions, with confidence flags); skill synthesizes the human-readable design-review report. |
 | [pdf-sidecar](pdf-sidecar/) | Extract a PDF into a cached sidecar of markdown + images so Claude reads the markdown instead of paying tokens to re-read the raw PDF on every session. Marker backend by default, Docling on `--high-fidelity`. Built-in verification gate compares baseline word/image counts against what the backend actually emitted. |
-| [tapo-power](tapo-power/) | Local-network control of a TP-Link Tapo P316M/P304M smart power strip: per-outlet on/off, power-cycle with wait-for-boot, per-outlet watts and energy, CSV logging. CLI plus an importable `tapo_power` Python module for other projects. |
+| [tapo-power](tapo-power/) | Local-network control of a TP-Link Tapo P316M/P304M smart power strip via python-kasa: per-outlet on/off, power-cycle with wait-for-boot, per-outlet power / current / voltage and energy, CSV logging. CLI plus an importable `tapo_power` Python module for other projects. |
 
 ## Dependencies
 

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from tapo_power import strip as strip_mod
@@ -12,16 +10,16 @@ BENCH_HOST = "10.0.0.5"
 
 
 class FakePlug:
-    """Stand-in for a `tapo` plug handler for one outlet."""
+    """Stand-in for tapo_power.strip._Plug (one outlet)."""
 
-    def __init__(self, position, nickname, *, device_on=False, on_time=0, is_usb=False, power=0):
+    def __init__(self, position, nickname, *, device_on=False, on_time=0, power=0.0, voltage=120.0):
         self.position = position
         self.nickname = nickname
         self.device_on = device_on
         self.on_time = on_time
-        self.is_usb = is_usb
         self.power = power
-        self.power_series: list[int] = []
+        self.voltage = voltage
+        self.power_series: list[float] = []
         self.today_energy = 0
         self.month_energy = 0
         self.ignore_commands = False
@@ -35,27 +33,27 @@ class FakePlug:
         if not self.ignore_commands:
             self.device_on = False
 
-    async def get_device_info(self):
-        return SimpleNamespace(device_on=self.device_on)
+    async def is_on(self):
+        return self.device_on
 
-    async def get_current_power(self):
+    async def reading(self):
         if self.raise_once_on_power is not None:
             exc, self.raise_once_on_power = self.raise_once_on_power, None
             raise exc
         if len(self.power_series) > 1:
-            v = self.power_series.pop(0)
+            w = self.power_series.pop(0)
         elif self.power_series:
-            v = self.power_series[0]
+            w = self.power_series[0]
         else:
-            v = self.power
-        return SimpleNamespace(current_power=v)
+            w = self.power
+        return {"power_w": float(w), "voltage_v": self.voltage, "current_a": w / self.voltage}
 
-    async def get_energy_usage(self):
-        return SimpleNamespace(today_energy=self.today_energy, month_energy=self.month_energy)
+    async def energy(self):
+        return {"today_wh": self.today_energy, "month_wh": self.month_energy}
 
 
 class FakeHandler:
-    """Stand-in for a `tapo` P316M strip handler."""
+    """Stand-in for tapo_power.strip._Connection (an open strip session)."""
 
     def __init__(self, plugs, *, model="P316M", ip=BENCH_HOST, mac=BENCH_MAC, fw_ver="1.0.0 Build 1", rssi=-50):
         self.plugs = plugs
@@ -64,52 +62,26 @@ class FakeHandler:
         self.mac = mac
         self.fw_ver = fw_ver
         self.rssi = rssi
+        self.closed = False
 
-    async def get_child_device_list(self):
+    async def children(self):
         return [
-            SimpleNamespace(
-                position=p.position,
-                nickname=p.nickname,
-                device_on=p.device_on,
-                on_time=p.on_time,
-                is_usb=p.is_usb,
-            )
+            {"position": p.position, "nickname": p.nickname, "on": p.device_on, "on_time_s": p.on_time}
             for p in sorted(self.plugs.values(), key=lambda x: x.position)
         ]
 
     async def plug(self, position):
         return self.plugs[position]
 
-    async def get_device_info(self):
-        return SimpleNamespace(model=self.model, ip=self.ip, mac=self.mac, fw_ver=self.fw_ver, rssi=self.rssi)
+    async def info(self):
+        return {"model": self.model, "host": self.ip, "mac": self.mac, "fw_ver": self.fw_ver, "rssi": self.rssi}
+
+    async def close(self):
+        self.closed = True
 
 
 def make_plugs(nicknames: dict[int, str]) -> dict[int, FakePlug]:
     return {pos: FakePlug(pos, nickname) for pos, nickname in nicknames.items()}
-
-
-def make_fake_api_client():
-    """Factory for a fake `tapo.ApiClient` with per-test-instance state, so that
-    monkeypatching `tapo_power.strip.ApiClient` with the returned class lets a
-    test script exactly which (user, password) pairs fail and how."""
-    calls: list[tuple[str, str]] = []
-    behaviors: dict[tuple[str, str], Exception] = {}
-
-    class FakeApiClient:
-        def __init__(self, user, password, timeout_s=None):
-            self.user = user
-            self.password = password
-
-        async def p316(self, host):
-            calls.append((self.user, self.password))
-            exc = behaviors.get((self.user, self.password))
-            if exc is not None:
-                raise exc
-            return SimpleNamespace(user=self.user, password=self.password, host=host)
-
-    FakeApiClient.calls = calls
-    FakeApiClient.behaviors = behaviors
-    return FakeApiClient
 
 
 @pytest.fixture(autouse=True)
@@ -119,11 +91,11 @@ def _isolate(monkeypatch, tmp_path):
 
     monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "isolated-config.json")
 
-    class NoNetworkApiClient:
-        def __init__(self, *a, **kw):
-            raise RuntimeError("test tried to build a real tapo ApiClient; fake _open/_discover instead")
+    async def no_network(*a, **kw):
+        raise RuntimeError("test tried to reach a real device; fake _open/_discover instead")
 
-    monkeypatch.setattr(strip_mod, "ApiClient", NoNetworkApiClient)
+    monkeypatch.setattr(strip_mod.Device, "connect", no_network)
+    monkeypatch.setattr(strip_mod.Discover, "discover", no_network)
 
 
 @pytest.fixture

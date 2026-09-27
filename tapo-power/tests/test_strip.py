@@ -11,7 +11,9 @@ from tapo_power import strip as strip_mod
 from tapo_power.config import Config, StripConfig, TapoPowerError
 from tapo_power.strip import OutletStatus, Strip, WaitTimeout
 
-from conftest import BENCH_HOST, FakeHandler, make_fake_api_client
+from kasa.exceptions import AuthenticationError, KasaException
+
+from conftest import BENCH_HOST, FakeHandler
 
 # --- outlet resolution ----------------------------------------------------
 
@@ -261,46 +263,175 @@ def test_adhoc_host_strip_does_not_save_config_on_rediscover(monkeypatch, tmp_pa
     assert not config_path.exists()
 
 
-# --- _open credential fallback --------------------------------------------------
+# --- python-kasa adapter (_open, _discover, _Connection, _Plug) ------------------
 
 
-def _auth_error():
-    return Exception('Tapo(Unauthorized { kind: "HASH_MISMATCH" })')
+class FakeProtocol:
+    def __init__(self, responses):
+        self.responses = responses
+
+    async def query(self, method):
+        return {method: self.responses[method]}
 
 
-def test_open_falls_back_to_next_credentials_on_auth_error(monkeypatch):
-    FakeApiClient = make_fake_api_client()
-    FakeApiClient.behaviors[("bad@x.com", "wrongpw")] = _auth_error()
-    monkeypatch.setattr(strip_mod, "ApiClient", FakeApiClient)
+class FakeKasaDevice:
+    def __init__(self, model="P316M", responses=None, children=None, mac="58:D8:12:14:1B:6F"):
+        self.model = model
+        self.mac = mac
+        self.protocol = FakeProtocol(responses or {})
+        self._children = children or {}
+        self.disconnected = False
 
-    creds = [("bad@x.com", "wrongpw"), ("test@tp-link.net", "test")]
-    handler = asyncio.run(strip_mod._open(BENCH_HOST, creds))
+    def get_child_device(self, device_id):
+        return self._children[device_id]
 
-    assert handler.user == "test@tp-link.net"
-    assert FakeApiClient.calls == creds
+    async def disconnect(self):
+        self.disconnected = True
 
 
-def test_open_all_credentials_fail_mentions_login(monkeypatch):
-    FakeApiClient = make_fake_api_client()
-    creds = [("a@x.com", "1"), ("b@x.com", "2")]
-    for c in creds:
-        FakeApiClient.behaviors[c] = _auth_error()
-    monkeypatch.setattr(strip_mod, "ApiClient", FakeApiClient)
+def _patch_connect(monkeypatch, result):
+    seen = {}
+
+    async def fake_connect(*, config):
+        seen["config"] = config
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(strip_mod.Device, "connect", fake_connect)
+    return seen
+
+
+def test_open_passes_account_credentials(monkeypatch):
+    seen = _patch_connect(monkeypatch, FakeKasaDevice())
+
+    conn = asyncio.run(strip_mod._open(BENCH_HOST, ("me@x.com", "pw")))
+
+    assert isinstance(conn, strip_mod._Connection)
+    assert seen["config"].host == BENCH_HOST
+    assert seen["config"].credentials.username == "me@x.com"
+    assert seen["config"].credentials.password == "pw"
+
+
+def test_open_without_account_passes_no_credentials(monkeypatch):
+    seen = _patch_connect(monkeypatch, FakeKasaDevice())
+
+    asyncio.run(strip_mod._open(BENCH_HOST, None))
+
+    assert seen["config"].credentials is None
+
+
+def test_open_auth_failure_mentions_login(monkeypatch):
+    _patch_connect(monkeypatch, AuthenticationError("bad hash"))
 
     with pytest.raises(TapoPowerError, match="tapo-power login"):
-        asyncio.run(strip_mod._open(BENCH_HOST, creds))
+        asyncio.run(strip_mod._open(BENCH_HOST, ("me@x.com", "wrong")))
 
 
-def test_open_nonauth_error_propagates_without_trying_later_pairs(monkeypatch):
-    FakeApiClient = make_fake_api_client()
-    creds = [("a@x.com", "1"), ("b@x.com", "2")]
-    FakeApiClient.behaviors[("a@x.com", "1")] = TimeoutError("timed out")
-    monkeypatch.setattr(strip_mod, "ApiClient", FakeApiClient)
+def test_open_nonauth_error_propagates(monkeypatch):
+    _patch_connect(monkeypatch, KasaException("timed out"))
 
-    with pytest.raises(TimeoutError):
-        asyncio.run(strip_mod._open(BENCH_HOST, creds))
+    with pytest.raises(KasaException):
+        asyncio.run(strip_mod._open(BENCH_HOST, None))
 
-    assert FakeApiClient.calls == [("a@x.com", "1")]
+
+def test_open_rejects_unsupported_model_and_disconnects(monkeypatch):
+    dev = FakeKasaDevice(model="P110M")
+    _patch_connect(monkeypatch, dev)
+
+    with pytest.raises(TapoPowerError, match="P110M"):
+        asyncio.run(strip_mod._open(BENCH_HOST, None))
+    assert dev.disconnected is True
+
+
+def test_discover_maps_kasa_results_and_disconnects(monkeypatch):
+    dev = FakeKasaDevice(model="P316M")
+    dev._discovery_info = {"device_model": "P316M(US)", "device_id": "abc", "owner": "", "obd_src": "matter"}
+
+    async def fake_discover(*, target, discovery_timeout):
+        assert target == "255.255.255.255"
+        return {"192.168.1.20": dev}
+
+    monkeypatch.setattr(strip_mod.Discover, "discover", fake_discover)
+
+    found = asyncio.run(strip_mod._discover("255.255.255.255", 1))
+
+    assert found == [{
+        "ip": "192.168.1.20", "model": "P316M(US)", "mac": "58:D8:12:14:1B:6F",
+        "device_id": "abc", "owner_bound": False, "onboarded_via": "matter",
+    }]
+    assert dev.disconnected is True
+
+
+def _kasa_strip():
+    child = FakeKasaDevice(responses={
+        "get_emeter_data": {"power_mw": 5569, "voltage_mv": 121405, "current_ma": 96, "energy_wh": 16},
+        "get_energy_usage": {"today_energy": 16, "month_energy": 40},
+        "get_device_info": {"device_on": True},
+    })
+    parent = FakeKasaDevice(
+        responses={
+            "get_child_device_list": {"child_device_list": [
+                {"position": 6, "device_id": "dev6", "nickname": "VGFwbyBTbWFydF9QbHVnXzY=",
+                 "device_on": True, "on_time": 42},
+            ], "start_index": 0, "sum": 1},
+            "get_device_info": {"model": "P316M", "ip": BENCH_HOST, "mac": "58-D8-12-14-1B-6F",
+                                "fw_ver": "1.0.5 Build 250306", "rssi": -40},
+        },
+        children={"dev6": child},
+    )
+    return strip_mod._Connection(parent), parent
+
+
+def test_connection_children_decodes_nicknames():
+    conn, _ = _kasa_strip()
+
+    kids = asyncio.run(conn.children())
+
+    assert kids == [{"position": 6, "nickname": "Tapo Smart_Plug_6", "on": True, "on_time_s": 42}]
+
+
+def test_plug_reading_converts_units():
+    conn, _ = _kasa_strip()
+
+    async def go():
+        plug = await conn.plug(6)
+        return await plug.reading(), await plug.energy(), await plug.is_on()
+
+    reading, energy, on = asyncio.run(go())
+
+    assert reading == {"power_w": 5.569, "voltage_v": 121.405, "current_a": 0.096}
+    assert energy == {"today_wh": 16, "month_wh": 40}
+    assert on is True
+
+
+def test_connection_info_and_close():
+    conn, parent = _kasa_strip()
+
+    info = asyncio.run(conn.info())
+    asyncio.run(conn.close())
+
+    assert info == {"model": "P316M", "host": BENCH_HOST, "mac": "58-D8-12-14-1B-6F",
+                    "fw_ver": "1.0.5 Build 250306", "rssi": -40}
+    assert parent.disconnected is True
+
+
+def test_sample_includes_voltage_and_current(strip, plugs):
+    plugs[3].power = 12.0
+    plugs[3].voltage = 120.0
+
+    (row,) = strip.sample(["arena"])
+
+    assert row.voltage_v == 120.0
+    assert row.current_a == pytest.approx(0.1)
+
+
+def test_close_disconnects_the_session(bench_config, patch_open, patch_discover_empty, handler):
+    s = Strip(config=bench_config)
+    s.outlets()
+    s.close()
+
+    assert handler.closed is True
 
 
 # --- log_csv -------------------------------------------------------------------

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import concurrent.futures
 import contextlib
 import csv
@@ -14,16 +16,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
-from tapo import ApiClient
+from kasa import Credentials, Device, DeviceConfig, Discover
+from kasa.deviceconfig import DeviceConnectionParameters, DeviceEncryptionType, DeviceFamily
+from kasa.exceptions import AuthenticationError
 
 from .config import Config, StripConfig, TapoPowerError, credentials
 
 logger = logging.getLogger("tapo_power")
 
-CONNECT_TIMEOUT_S = 8
+CONNECT_TIMEOUT_S = 5
 DISCOVERY_TIMEOUT_S = 3
 SUPPORTED_MODELS = ("P304M", "P316M")
-CSV_FIELDS = ["timestamp", "elapsed_s", "strip", "position", "name", "on", "power_w"]
+CSV_FIELDS = ["timestamp", "elapsed_s", "strip", "position", "name", "on", "power_w", "voltage_v", "current_a"]
+
+# P304M/P316M speak KLAP v2 over HTTP. Connecting with known parameters skips
+# UDP discovery, so control still works where broadcasts can't reach.
+_CONNECTION = DeviceConnectionParameters(DeviceFamily.SmartTapoPlug, DeviceEncryptionType.Klap, login_version=2)
 
 Outlet = int | str
 
@@ -40,6 +48,8 @@ class OutletStatus:
     on: bool
     on_time_s: int
     power_w: float | None = None
+    voltage_v: float | None = None
+    current_a: float | None = None
     today_wh: int | None = None
     month_wh: int | None = None
 
@@ -63,8 +73,11 @@ def _norm_mac(mac: str) -> str:
     return re.sub(r"[^0-9a-f]", "", mac.lower())
 
 
-def _is_auth_error(e: Exception) -> bool:
-    return "Unauthorized" in str(e) or "HASH_MISMATCH" in str(e)
+def _decode_nickname(raw: str) -> str:
+    try:
+        return base64.b64decode(raw, validate=True).decode()
+    except (binascii.Error, UnicodeDecodeError):
+        return raw
 
 
 def _run_isolated(coro):
@@ -74,44 +87,114 @@ def _run_isolated(coro):
         return ex.submit(asyncio.run, coro).result()
 
 
-async def _open(host: str, creds: list[tuple[str, str]]):
-    last_auth_error = None
-    for user, password in creds:
-        try:
-            return await ApiClient(user, password, timeout_s=CONNECT_TIMEOUT_S).p316(host)
-        except Exception as e:
-            if not _is_auth_error(e):
-                raise
-            last_auth_error = e
-    raise TapoPowerError(
-        f"Authentication failed at {host}. If the strip was added to the Tapo app, "
-        f"store that account with `tapo-power login <email>`. ({last_auth_error})"
+class _Plug:
+    """One outlet. Talks the device's own JSON methods through python-kasa's
+    authenticated protocol; get_emeter_data needs energy_monitoring v2."""
+
+    def __init__(self, child: Device):
+        self._child = child
+
+    async def _query(self, method: str) -> dict:
+        return (await self._child.protocol.query(method))[method]
+
+    async def on(self) -> None:
+        await self._child.turn_on()
+
+    async def off(self) -> None:
+        await self._child.turn_off()
+
+    async def is_on(self) -> bool:
+        return (await self._query("get_device_info"))["device_on"]
+
+    async def reading(self) -> dict:
+        d = await self._query("get_emeter_data")
+        return {"power_w": d["power_mw"] / 1000, "voltage_v": d["voltage_mv"] / 1000, "current_a": d["current_ma"] / 1000}
+
+    async def energy(self) -> dict:
+        d = await self._query("get_energy_usage")
+        return {"today_wh": d["today_energy"], "month_wh": d["month_energy"]}
+
+
+class _Connection:
+    """An authenticated session with one strip — the only code that knows python-kasa."""
+
+    def __init__(self, dev: Device):
+        self._dev = dev
+        self._plugs: dict[int, _Plug] = {}
+
+    async def _query(self, method: str) -> dict:
+        return (await self._dev.protocol.query(method))[method]
+
+    async def children(self) -> list[dict]:
+        kids = (await self._query("get_child_device_list"))["child_device_list"]
+        for k in kids:
+            if k["position"] not in self._plugs:
+                self._plugs[k["position"]] = _Plug(self._dev.get_child_device(k["device_id"]))
+        return [
+            {
+                "position": k["position"],
+                "nickname": _decode_nickname(k.get("nickname", "")),
+                "on": k["device_on"],
+                "on_time_s": k.get("on_time", 0),
+            }
+            for k in kids
+        ]
+
+    async def plug(self, position: int) -> _Plug:
+        if position not in self._plugs:
+            await self.children()
+        return self._plugs[position]
+
+    async def info(self) -> dict:
+        d = await self._query("get_device_info")
+        return {"model": d["model"], "host": d["ip"], "mac": d["mac"], "fw_ver": d["fw_ver"], "rssi": d["rssi"]}
+
+    async def close(self) -> None:
+        await self._dev.disconnect()
+
+
+async def _open(host: str, creds: tuple[str, str] | None) -> _Connection:
+    config = DeviceConfig(
+        host=host,
+        credentials=Credentials(*creds) if creds else None,
+        connection_type=_CONNECTION,
+        timeout=CONNECT_TIMEOUT_S,
     )
+    try:
+        dev = await Device.connect(config=config)
+    except AuthenticationError as e:
+        raise TapoPowerError(
+            f"Authentication failed at {host}. If the strip was added to the Tapo app, "
+            f"store that account with `tapo-power login <email>`. ({e})"
+        ) from e
+    if not dev.model.startswith(SUPPORTED_MODELS):
+        await dev.disconnect()
+        raise TapoPowerError(f"{host} is a {dev.model}; only {', '.join(SUPPORTED_MODELS)} strips are supported")
+    return _Connection(dev)
 
 
 async def _discover(target: str, timeout_s: int) -> list[dict]:
-    found = []
-    async for maybe in await ApiClient.discover_devices_raw(target, timeout_s):
-        try:
-            r = maybe.get()
-        except Exception:
-            continue
-        res = r.message.get("result", {})
-        found.append(
+    found = await Discover.discover(target=target, discovery_timeout=timeout_s)
+    result = []
+    for ip, dev in found.items():
+        info = getattr(dev, "_discovery_info", None) or {}
+        result.append(
             {
-                "ip": r.ip,
-                "model": res.get("device_model"),
-                "mac": res.get("mac"),
-                "device_id": res.get("device_id"),
-                "owner_bound": bool(res.get("owner")),
-                "onboarded_via": res.get("obd_src"),
+                "ip": ip,
+                "model": info.get("device_model") or dev.model,
+                "mac": dev.mac,
+                "device_id": info.get("device_id"),
+                "owner_bound": bool(info.get("owner")),
+                "onboarded_via": info.get("obd_src"),
             }
         )
-    return found
+        with contextlib.suppress(Exception):
+            await dev.disconnect()
+    return result
 
 
 def discover(target: str = "255.255.255.255", timeout_s: int = DISCOVERY_TIMEOUT_S) -> list[dict]:
-    """Broadcast Tapo discovery (UDP 20002). Needs no credentials."""
+    """Broadcast TP-Link discovery (UDP 20002/9999). Needs no credentials."""
     return _run_isolated(_discover(target, timeout_s))
 
 
@@ -138,9 +221,8 @@ class Strip:
             self._cfg = self._config.strip(name)
             self._persist = True
         self._creds = credentials(self._config.account)
-        self._handler = None
-        self._plugs: dict[int, object] = {}
-        self._kids: list = []
+        self._handler: _Connection | None = None
+        self._kids: list[dict] = []
         self._lock = threading.Lock()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="tapo-power")
@@ -155,10 +237,14 @@ class Strip:
         return self._cfg.host
 
     def close(self) -> None:
-        if self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join(timeout=5)
-            self._loop.close()
+        if not self._loop.is_running():
+            return
+        if self._handler is not None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(self._handler.close(), self._loop).result(timeout=5)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5)
+        self._loop.close()
 
     def __enter__(self) -> Strip:
         return self
@@ -190,7 +276,10 @@ class Strip:
                 raise TapoPowerError(f"{self.name}: {e}") from e
 
     async def _connect(self) -> None:
-        self._handler, self._plugs = None, {}
+        if self._handler is not None:
+            with contextlib.suppress(Exception):
+                await self._handler.close()
+        self._handler = None
         try:
             self._handler = await _open(self._cfg.host, self._creds)
             return
@@ -223,14 +312,9 @@ class Strip:
             self._config.save()
         return ips[0]
 
-    async def _children(self) -> list:
-        self._kids = await self._handler.get_child_device_list()
+    async def _children(self) -> list[dict]:
+        self._kids = await self._handler.children()
         return self._kids
-
-    async def _plug(self, position: int):
-        if position not in self._plugs:
-            self._plugs[position] = await self._handler.plug(position=position)
-        return self._plugs[position]
 
     def _display_name(self, position: int, nickname: str) -> str:
         for alias, pos in self._cfg.outlets.items():
@@ -240,7 +324,7 @@ class Strip:
 
     async def _resolve(self, outlet: Outlet) -> int:
         kids = self._kids or await self._children()
-        positions = sorted(k.position for k in kids)
+        positions = sorted(k["position"] for k in kids)
         if isinstance(outlet, int) or str(outlet).strip().isdigit():
             pos = int(outlet)
             if pos in positions:
@@ -250,34 +334,38 @@ class Strip:
         for alias, pos in self._cfg.outlets.items():
             if alias.lower() == key:
                 return pos
-        matches = [k.position for k in kids if k.nickname.lower() == key]
+        matches = [k["position"] for k in kids if k["nickname"].lower() == key]
         if len(matches) == 1:
             return matches[0]
         if matches:
             raise TapoPowerError(f"Outlet name {outlet!r} is ambiguous (positions {matches})")
-        known = sorted(set(self._cfg.outlets) | {k.nickname for k in kids})
+        known = sorted(set(self._cfg.outlets) | {k["nickname"] for k in kids})
         raise TapoPowerError(f"Unknown outlet {outlet!r}. Use 1-{max(positions)} or one of: {', '.join(known)}")
 
     async def _resolve_many(self, outlets: Iterable[Outlet] | None) -> list[int]:
         if outlets is None:
-            return sorted(k.position for k in (self._kids or await self._children()))
+            return sorted(k["position"] for k in (self._kids or await self._children()))
         return [await self._resolve(o) for o in outlets]
 
-    def _status_of(self, kid) -> OutletStatus:
+    def _status_of(self, kid: dict) -> OutletStatus:
         return OutletStatus(
-            position=kid.position,
-            name=self._display_name(kid.position, kid.nickname),
-            nickname=kid.nickname,
-            on=kid.device_on,
-            on_time_s=kid.on_time,
+            position=kid["position"],
+            name=self._display_name(kid["position"], kid["nickname"]),
+            nickname=kid["nickname"],
+            on=kid["on"],
+            on_time_s=kid["on_time_s"],
         )
+
+    async def _read_into(self, st: OutletStatus) -> OutletStatus:
+        r = await (await self._handler.plug(st.position)).reading()
+        st.power_w, st.voltage_v, st.current_a = r["power_w"], r["voltage_v"], r["current_a"]
+        return st
 
     async def _set(self, outlet: Outlet, on: bool) -> int:
         pos = await self._resolve(outlet)
-        plug = await self._plug(pos)
+        plug = await self._handler.plug(pos)
         await (plug.on() if on else plug.off())
-        info = await plug.get_device_info()
-        if info.device_on != on:
+        if await plug.is_on() != on:
             raise TapoPowerError(f"Outlet {pos} did not switch {'on' if on else 'off'}")
         return pos
 
@@ -296,56 +384,41 @@ class Strip:
         return self._run(op)
 
     def sample(self, outlets: Iterable[Outlet] | None = None) -> list[OutletStatus]:
-        """State plus instantaneous power (W) for the given outlets (default all)."""
+        """State plus power (W), voltage (V) and current (A) for the given outlets (default all)."""
 
         async def op():
-            kids = {k.position: k for k in await self._children()}
-            rows = []
-            for pos in await self._resolve_many(outlets):
-                st = self._status_of(kids[pos])
-                st.power_w = float((await (await self._plug(pos)).get_current_power()).current_power)
-                rows.append(st)
-            return rows
+            kids = {k["position"]: k for k in await self._children()}
+            return [await self._read_into(self._status_of(kids[pos])) for pos in await self._resolve_many(outlets)]
 
         return self._run(op)
 
     def status(self) -> StripStatus:
-        """Strip info plus power and today/month energy for every outlet."""
+        """Strip info plus readings and today/month energy for every outlet."""
 
         async def op():
-            info = await self._handler.get_device_info()
-            result = StripStatus(
-                name=self.name,
-                model=info.model,
-                host=info.ip,
-                mac=info.mac,
-                fw_ver=info.fw_ver,
-                rssi=info.rssi,
-            )
+            info = await self._handler.info()
+            result = StripStatus(name=self.name, **info)
             for kid in await self._children():
-                st = self._status_of(kid)
-                plug = await self._plug(kid.position)
-                st.power_w = float((await plug.get_current_power()).current_power)
-                usage = await plug.get_energy_usage()
-                st.today_wh, st.month_wh = usage.today_energy, usage.month_energy
+                st = await self._read_into(self._status_of(kid))
+                e = await (await self._handler.plug(kid["position"])).energy()
+                st.today_wh, st.month_wh = e["today_wh"], e["month_wh"]
                 result.outlets.append(st)
             return result
 
         return self._run(op)
 
     def power(self, outlet: Outlet) -> float:
-        """Instantaneous power draw of one outlet, in watts (1 W resolution)."""
+        """Real power draw of one outlet, in watts (mW resolution)."""
 
         async def op():
-            plug = await self._plug(await self._resolve(outlet))
-            return float((await plug.get_current_power()).current_power)
+            plug = await self._handler.plug(await self._resolve(outlet))
+            return (await plug.reading())["power_w"]
 
         return self._run(op)
 
     def is_on(self, outlet: Outlet) -> bool:
         async def op():
-            plug = await self._plug(await self._resolve(outlet))
-            return (await plug.get_device_info()).device_on
+            return await (await self._handler.plug(await self._resolve(outlet))).is_on()
 
         return self._run(op)
 
@@ -413,10 +486,10 @@ class Strip:
         stop: threading.Event | None = None,
         on_sample: Callable[[list[OutletStatus]], None] | None = None,
     ) -> int:
-        """Log per-outlet power as tidy CSV (one row per outlet per sample) until
-        duration_s elapses or stop is set. A path is appended to (header only if
-        new); a stream is written as-is. Failed samples are logged and skipped.
-        Returns the number of samples written."""
+        """Log per-outlet readings as tidy CSV (one row per outlet per sample)
+        until duration_s elapses or stop is set. A path is appended to (header
+        only if new); a stream is written as-is. Failed samples are logged and
+        skipped. Returns the number of samples written."""
         kwargs = dict(interval_s=interval_s, duration_s=duration_s, outlets=outlets, stop=stop, on_sample=on_sample)
         if hasattr(dest, "write"):
             return self._log(dest, write_header=True, **kwargs)
@@ -445,7 +518,8 @@ class Strip:
                 logger.warning("sample failed: %s", e)
             else:
                 for o in rows:
-                    writer.writerow([ts, f"{now - t0:.3f}", self.name, o.position, o.name, int(o.on), o.power_w])
+                    writer.writerow([ts, f"{now - t0:.3f}", self.name, o.position, o.name, int(o.on),
+                                     o.power_w, o.voltage_v, o.current_a])
                 f.flush()
                 n += 1
                 if on_sample:
@@ -462,7 +536,7 @@ class Strip:
         interval_s: float = 1.0,
         outlets: Iterable[Outlet] | None = None,
     ) -> Iterator[None]:
-        """Log power to CSV in a background thread for the duration of a with-block."""
+        """Log readings to CSV in a background thread for the duration of a with-block."""
         stop = threading.Event()
         t = threading.Thread(
             target=self.log_csv,

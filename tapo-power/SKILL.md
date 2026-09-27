@@ -1,20 +1,20 @@
 ---
 name: tapo-power
-description: Control and monitor TP-Link Tapo P316M (and P304M) smart power strips over the local network — switch individual outlets on/off, power-cycle lab electronics (optionally waiting until the device draws power again), read per-outlet watts and today/month energy, and log power to CSV during experiments. Provides a CLI (`bin/tapo-power`) and an importable Python module (`from tapo_power import Strip`) for other projects, scripts, and MATLAB. Use when the user mentions the Tapo strip, P316M, smart power strip, "power cycle", "turn off/on outlet N", "reboot the arena power supply", "how much power is X drawing", "log power consumption", or names an outlet alias like ArenaPS. Do NOT use for Kasa-brand plugs (HS/KP/EP series) or non-Tapo PDUs.
+description: Control and monitor TP-Link Tapo P316M (and P304M) smart power strips over the local network — switch individual outlets on/off, power-cycle lab electronics (optionally waiting until the device draws power again), read per-outlet power, current and voltage (mW/mA/mV resolution) plus today/month energy, and log them to CSV during experiments. Provides a CLI (`bin/tapo-power`) and an importable Python module (`from tapo_power import Strip`) for other projects, scripts, and MATLAB. Use when the user mentions the Tapo strip, P316M, smart power strip, "power cycle", "turn off/on outlet N", "reboot the arena power supply", "how much power/current is X drawing", "log power consumption", or names an outlet alias like ArenaPS. Do NOT use for Kasa-brand plugs (HS/KP/EP series) or non-Tapo PDUs.
 argument-hint: [status | on | off | cycle | power | log | discover | add | alias] [outlet]
 ---
 
 # Tapo Power Strip Control
 
-Local-network control of a Tapo P316M (6 individually switched, individually metered outlets) via the [`tapo`](https://github.com/mihai-dinculescu/tapo) Rust/Python library. No cloud round-trip, and it doesn't touch the strip's Matter pairing — the strip stays in Apple Home.
+Local-network control of a Tapo P316M (6 individually switched, individually metered outlets) via [`python-kasa`](https://github.com/python-kasa/python-kasa) (the library behind Home Assistant's TP-Link integration). No cloud round-trip, and it doesn't touch the strip's Matter pairing — the strip stays in Apple Home.
 
 | Capability | How |
 |---|---|
 | Per-outlet on / off | `tapo-power on ArenaPS`, `tapo-power off 3` |
 | Power-cycle, optionally wait for boot | `tapo-power cycle ArenaPS --off-s 5 --wait-above-w 3` |
-| Live readout (W, today/month Wh) | `tapo-power status` |
-| One outlet's watts (script-friendly) | `tapo-power power ArenaPS` → `11` |
-| CSV power logging | `tapo-power log --out run.csv --interval-s 1` |
+| Live readout (W, mA, mains V, today/month Wh) | `tapo-power status` |
+| One outlet's watts (script-friendly) | `tapo-power power ArenaPS` → `2.705` |
+| CSV logging of W / V / A | `tapo-power log --out run.csv --interval-s 1` |
 | Python API for other projects | `from tapo_power import Strip` |
 | Find strips on the LAN | `tapo-power discover` |
 
@@ -37,7 +37,7 @@ Cutting power is not undoable for whatever is plugged in. Before `off` or `cycle
 The config lives at `~/.config/tapo-power/config.json` (override with `TAPO_POWER_CONFIG`). Check it first — if a strip is already configured, skip to usage.
 
 ```bash
-tapo-power discover                    # no credentials needed; UDP 20002 broadcast
+tapo-power discover                    # no credentials needed; UDP broadcast
 tapo-power add SmartPowerStrip         # auto-picks the only P304M/P316M found; or: add NAME IP
 tapo-power alias ArenaPS 6             # name outlet 6
 tapo-power unalias ArenaPS
@@ -59,25 +59,25 @@ Config format (hand-editable):
 
 ### Credentials
 
-- **Matter-only strips** (set up via Apple Home, never added to the Tapo app — discovery shows `no account, onboarded via matter`) accept TP-Link's factory-default local credentials. Nothing to configure. This is the current setup.
+- **Matter-only strips** (set up via Apple Home, never added to the Tapo app — discovery shows `no account, onboarded via matter`) accept TP-Link's factory-default local credentials, which python-kasa uses automatically. Nothing to configure. This is the current setup.
 - **Account-bound strips** (added to the Tapo app) only accept that TP-Link account. The user must run, in their own terminal (it prompts for a password — Claude can't type it):
   ```bash
   tapo-power login you@example.com
   ```
   The password goes to the macOS Keychain (service `tapo-power`); only the email is written to the config. The Tapo app's **Me → Third-Party Services → Third-Party Compatibility** must also be ON, or newer firmware refuses local control.
 
-Credentials are tried in order: stored account, then factory default — so a mix of owned and unowned strips works.
+With an account stored, python-kasa tries it first and still falls back to the factory defaults, so a mix of owned and unowned strips works.
 
 ## CLI reference
 
 ```bash
-tapo-power status                       # table: state, W, today/month Wh, time since last switch
-tapo-power --json status                # includes total_w
+tapo-power status                       # table: state, W, mA, today/month Wh, time since last switch; mains V in header
+tapo-power --json status                # per-outlet power_w, voltage_v, current_a; plus total_w
 tapo-power on ArenaPS                   # switches, then re-reads the relay to confirm
 tapo-power off 3
 tapo-power cycle ArenaPS                # off, 5 s, on
 tapo-power cycle ArenaPS --off-s 10 --wait-above-w 3 --timeout-s 90
-tapo-power power ArenaPS                # prints integer watts
+tapo-power power ArenaPS                # prints watts, e.g. 2.705
 tapo-power log                          # tidy CSV to stdout until Ctrl-C (a live readout)
 tapo-power log --out run.csv --interval-s 0.5 --duration-s 3600 --outlets ArenaPS,1
 ```
@@ -99,7 +99,7 @@ pip install -e ~/Documents/GitHub/claude-skills/tapo-power          # plain venv
 from tapo_power import Strip, WaitTimeout
 
 with Strip() as strip:                          # default strip from config; Strip("name") or Strip(host="1.2.3.4")
-    print(strip.power("ArenaPS"))               # 11.0 (W)
+    print(strip.power("ArenaPS"))               # 2.705 (W)
     strip.off("ArenaPS"); strip.on("ArenaPS")   # each confirms the relay state, returns the position
 
     # Power-cycle and block until the device is drawing > 3 W again (booted).
@@ -113,7 +113,7 @@ with Strip() as strip:                          # default strip from config; Str
         run_experiment()
 
     st = strip.status()                         # StripStatus: model, host, rssi, outlets[..], total_w
-    rows = strip.sample()                       # list[OutletStatus] with power_w, no energy (faster)
+    rows = strip.sample()                       # list[OutletStatus]: power_w, voltage_v, current_a (no energy; faster)
     strip.wait_for_power("ArenaPS", below_w=1, timeout_s=30)
 ```
 
@@ -132,8 +132,8 @@ tp = '~/.claude/skills/tapo-power/bin/tapo-power';
 Tidy — one row per outlet per sample:
 
 ```
-timestamp,elapsed_s,strip,position,name,on,power_w
-2026-09-26T22:18:18.412-04:00,0.000,SmartPowerStrip,6,ArenaPS,1,9.0
+timestamp,elapsed_s,strip,position,name,on,power_w,voltage_v,current_a
+2026-09-26T23:13:36.891-04:00,0.000,SmartPowerStrip,6,ArenaPS,1,2.719,121.159,0.052
 ```
 
 `name` is the alias if set, otherwise the Tapo nickname. `elapsed_s` is monotonic from the start of that logging call.
@@ -142,18 +142,21 @@ timestamp,elapsed_s,strip,position,name,on,power_w
 
 | Property | Value |
 |---|---|
-| Power resolution | **1 W** (integer watts — no mW field on P316M outlets) |
-| Meter lag / smoothing | Reading trails reality by ~1.5–3 s after a switch and ramps rather than steps. Don't use it for sub-second timing. |
-| Switch latency | ~0.3–0.5 s including the confirming read-back |
-| Read latency | ~20 ms per outlet; a full 6-outlet sample ~0.2 s. 0.5 s logging intervals work. |
-| Voltage / current | Not exposed by the local API |
-| Energy counters | today / month Wh per outlet (`status`) |
+| Readings | Per outlet via `get_emeter_data`: real power (mW), RMS voltage (mV), RMS current (mA). Needs the outlet's `energy_monitoring` component v2 (P316M fw 1.0.5 has it). |
+| Meter refresh | About once per second; 1 Hz logging sees a new value ~92% of the time. Faster sampling just repeats values. |
+| Meter lag after switching | ~1.5–3 s, and the reading ramps rather than steps (measured on the earlier `tapo`-library backend; not yet re-measured). Don't use it for sub-second timing. |
+| Power factor | Power is real W; V × A is apparent VA. Small switching supplies show PF ≈ 0.5 (ArenaPS idles at ~0.48). |
+| Connect | ~1 s (KLAP handshake + first update); a `Strip` reuses the session afterwards |
+| Switch latency | ~0.1–0.2 s including the confirming read-back |
+| Read latency | full 6-outlet sample ~0.25 s; `status` (adds energy) ~0.8 s |
+| Energy counters | today / month Wh per outlet (`status`). The strip also keeps 5-minute average power history, not exposed by the CLI. |
+| Mains voltage | ~121 V RMS at home, varying ±0.2 V — the same on every outlet, so `status` shows it once |
 
-Consequence for `--wait-above-w`: after switching on, the reading stays at 0 W for a couple of seconds even if the load draws immediately; the threshold wait handles this, but give `--timeout-s` headroom.
+Consequence for `--wait-above-w`: after switching on, the reading may stay near 0 W for a couple of seconds even if the load draws immediately; the threshold wait handles this, but give `--timeout-s` headroom.
 
 ## Network notes
 
-- Control is HTTP (TCP 80, KLAP-encrypted) to the strip's IP; discovery is UDP 20002 broadcast. The Mac and strip must be on the same LAN segment for discovery; direct control only needs routability.
+- Control is HTTP (TCP 80, KLAP-encrypted) to the strip's IP, connecting with known protocol parameters, so it needs no UDP. Discovery is UDP broadcast (ports 20002 and 9999) and only works on the same LAN segment; direct control only needs routability.
 - **Security:** a Matter-only strip accepts the published factory-default credentials, so anything on the same network can switch it. Fine at home; on shared networks (Janelia) prefer binding it to a TP-Link account (`login`) or an isolated IoT VLAN.
 - Janelia's managed Wi-Fi likely blocks the strip from joining or isolates clients; expect to need a lab-controlled network (e.g., a travel router on the bench). Broadcast discovery won't cross subnets — use `add NAME IP`.
 
@@ -161,7 +164,7 @@ Consequence for `--wait-above-w`: after switching on, the reading stays at 0 W f
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Authentication failed ... HASH_MISMATCH` | Strip is bound to a Tapo account, or the stored password is stale | `tapo-power login <email>` (user runs it); enable Third-Party Compatibility in the Tapo app |
+| `Authentication failed at ...` | Strip is bound to a Tapo account, or the stored password is stale | `tapo-power login <email>` (user runs it); enable Third-Party Compatibility in the Tapo app |
 | `Cannot reach strip ... ` | IP changed and MAC re-discovery failed, strip offline, or different network | `tapo-power discover`; then `tapo-power add NAME NEW_IP` |
 | Discovery finds nothing but the strip works in Apple Home | Mac on a different subnet / VPN, or macOS Local Network permission denied | System Settings → Privacy & Security → Local Network → allow the terminal app / Claude; disconnect VPN |
 | `discover` occasionally returns nothing | Discovery is a single UDP broadcast; replies sometimes drop | Rerun it (automatic IP re-find already tries twice) |
@@ -176,4 +179,4 @@ cd ~/Documents/GitHub/claude-skills/tapo-power
 uv run pytest tests -q          # fakes only — no network, no Keychain
 ```
 
-The device seam is two async functions in `tapo_power/strip.py` — `_open(host, creds)` and `_discover(target, timeout_s)`; tests monkeypatch them. Other Tapo models (P110 plugs, P300 strips) would need their own `ApiClient` method in `_open`; only P304M/P316M are supported today.
+All python-kasa code lives in `tapo_power/strip.py`: `_open(host, creds)` returns a `_Connection` (child list, device info, per-outlet `_Plug` with `reading()` / `energy()` / `on()` / `off()`), and `_discover(target, timeout_s)` wraps broadcast discovery. Tests monkeypatch `_open`/`_discover` with fakes of that interface, and an autouse fixture blocks real network calls. `_Plug` sends the strip's own JSON methods (`get_emeter_data`, `get_energy_usage`) through python-kasa's authenticated protocol. Only P304M/P316M are accepted (`SUPPORTED_MODELS`, and `_CONNECTION` hard-codes their KLAP v2 parameters); other Tapo strips would need both relaxed.
