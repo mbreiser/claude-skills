@@ -11,6 +11,9 @@
 # Local test runs for pdf-sidecar (real-PDF extractions, not for VCS)
 .test-runs/
 
+# uv-managed virtualenvs (tapo-power)
+.venv/
+
 # Python bytecode
 __pycache__/
 *.pyc

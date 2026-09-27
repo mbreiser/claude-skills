@@ -1,0 +1,22 @@
+[project]
+name = "tapo-power"
+version = "0.1.0"
+description = "Local control and power monitoring for TP-Link Tapo P316M / P304M smart power strips"
+requires-python = ">=3.11"
+dependencies = [
+    "tapo>=0.9,<0.10",
+    "keyring>=25",
+]
+
+[project.scripts]
+tapo-power = "tapo_power.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tapo_power"]

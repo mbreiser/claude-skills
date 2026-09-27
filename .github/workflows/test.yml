@@ -69,3 +69,29 @@ jobs:
         run: |
           uv run --python ${{ matrix.python-version }} \
             --script bin/pdf-sidecar.py --help
+
+  # tapo-power tests — the device seam (_open/_discover) is faked, so no
+  # network, power strip, or Keychain is touched in CI.
+  tapo-power:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Run pytest (tapo-power)
+        working-directory: tapo-power
+        run: uv run --python ${{ matrix.python-version }} --project . pytest tests -v
+
+      - name: Smoke-test CLI --help
+        working-directory: tapo-power
+        run: uv run --python ${{ matrix.python-version }} --project . tapo-power --help
