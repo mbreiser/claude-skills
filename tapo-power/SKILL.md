@@ -143,13 +143,14 @@ timestamp,elapsed_s,strip,position,name,on,power_w,voltage_v,current_a
 | Property | Value |
 |---|---|
 | Readings | Per outlet via `get_emeter_data`: real power (mW), RMS voltage (mV), RMS current (mA). Needs the outlet's `energy_monitoring` component v2 (P316M fw 1.0.5 has it). |
-| Meter refresh | About once per second; 1 Hz logging sees a new value ~92% of the time. Faster sampling just repeats values. |
+| Meter refresh | A new reading every ~1.1 s (median 1.09 s, IQR 1.05–1.12 s, timed from mV voltage changes). This is the real ceiling: polling faster only repeats values, and at exactly 1 Hz ~8% of samples repeat. Each reading is averaged over that window, so short inrush peaks are smoothed away. |
 | Meter lag after switching | ~1.5–3 s, and the reading ramps rather than steps (measured on the earlier `tapo`-library backend; not yet re-measured). Don't use it for sub-second timing. |
 | Power factor | Power is real W; V × A is apparent VA. Small switching supplies show PF ≈ 0.5 (ArenaPS idles at ~0.48). |
 | Connect | ~1 s (KLAP handshake + first update); a `Strip` reuses the session afterwards |
 | Switch latency | ~0.1–0.2 s including the confirming read-back |
-| Read latency | full 6-outlet sample ~0.25 s; `status` (adds energy) ~0.8 s |
-| Energy counters | today / month Wh per outlet (`status`). The strip also keeps 5-minute average power history, not exposed by the CLI. |
+| Read throughput | `power()` on one outlet ~23 ms (~40 req/s); `sample()` one outlet ~150 ms, all 6 outlets ~250 ms (~4/s); `status` (adds energy) ~0.8 s. The network is never the bottleneck. |
+| Energy counters | today / month Wh per outlet (`status`). The strip also stores 5-minute average power per outlet (back to when it was powered up), not exposed by the CLI. |
+| Practical logging rates | 1 Hz to catch transients (~7 MB/day per outlet as CSV); 5–10 s for long runs; for hours-to-days trends the strip's own 5-minute history needs nothing running. |
 | Mains voltage | ~121 V RMS at home, varying ±0.2 V — the same on every outlet, so `status` shows it once |
 
 Consequence for `--wait-above-w`: after switching on, the reading may stay near 0 W for a couple of seconds even if the load draws immediately; the threshold wait handles this, but give `--timeout-s` headroom.
