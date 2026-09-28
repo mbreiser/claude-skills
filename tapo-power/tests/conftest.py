@@ -97,6 +97,7 @@ def _isolate(monkeypatch, tmp_path):
 
     monkeypatch.setattr(strip_mod.Device, "connect", no_network)
     monkeypatch.setattr(strip_mod.Discover, "discover", no_network)
+    monkeypatch.setattr(strip_mod.Discover, "discover_single", no_network)
 
     async def no_mdns(mac, timeout_s=None):
         return None

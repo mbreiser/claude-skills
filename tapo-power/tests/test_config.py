@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tapo_power.config import Config, StripConfig, TapoPowerError, credentials
+from tapo_power.config import FACTORY_CREDENTIALS, Config, StripConfig, TapoPowerError, credentials
 
 
 def test_save_load_round_trip(tmp_path):
@@ -49,8 +49,8 @@ def test_strip_unknown_name_lists_configured_names():
     assert "bench" in str(exc_info.value)
 
 
-def test_credentials_no_account_is_none():
-    assert credentials(None) is None
+def test_credentials_no_account_is_factory_only():
+    assert credentials(None) == [FACTORY_CREDENTIALS]
 
 
 def test_credentials_with_stored_password(monkeypatch):
@@ -59,10 +59,10 @@ def test_credentials_with_stored_password(monkeypatch):
         lambda service, account: "s3cret" if account == "a@b.c" else None,
     )
 
-    assert credentials("a@b.c") == ("a@b.c", "s3cret")
+    assert credentials("a@b.c") == [("a@b.c", "s3cret"), FACTORY_CREDENTIALS]
 
 
 def test_credentials_account_without_stored_password(monkeypatch):
     monkeypatch.setattr("keyring.get_password", lambda service, account: None)
 
-    assert credentials("a@b.c") is None
+    assert credentials("a@b.c") == [FACTORY_CREDENTIALS]

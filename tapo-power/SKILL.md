@@ -6,7 +6,7 @@ argument-hint: [status | on | off | cycle | power | log | discover | add | alias
 
 # Tapo Power Strip Control
 
-Local-network control of a Tapo P316M (6 individually switched, individually metered outlets) via [`python-kasa`](https://github.com/python-kasa/python-kasa) (the library behind Home Assistant's TP-Link integration). No cloud round-trip, and it doesn't touch the strip's Matter pairing — the strip stays in Apple Home.
+Local-network control of a Tapo P316M (6 individually switched, individually metered outlets) via [`python-kasa`](https://github.com/python-kasa/python-kasa) (the library behind Home Assistant's TP-Link integration), pinned to its TPAP branch because TP-Link firmware now moves strips to the TPAP protocol. No cloud round-trip, and it doesn't touch the strip's Matter pairing — the strip stays in Apple Home.
 
 | Capability | How |
 |---|---|
@@ -59,14 +59,14 @@ Config format (hand-editable):
 
 ### Credentials
 
-- **Matter-only strips** (set up via Apple Home, never added to the Tapo app — discovery shows `no account, onboarded via matter`) accept TP-Link's factory-default local credentials, which python-kasa uses automatically. Nothing to configure. This is the current setup.
+- **Matter-only strips** (set up via Apple Home, never added to the Tapo app — discovery shows `no account, onboarded via matter`) accept TP-Link's factory-default local credentials, which the skill sends automatically. Nothing to configure. This is the current setup.
 - **Account-bound strips** (added to the Tapo app) only accept that TP-Link account. The user must run, in their own terminal (it prompts for a password — Claude can't type it):
   ```bash
   tapo-power login you@example.com
   ```
-  The password goes to the macOS Keychain (service `tapo-power`); only the email is written to the config. The Tapo app's **Me → Third-Party Services → Third-Party Compatibility** must also be ON, or newer firmware refuses local control.
+  The password goes to the macOS Keychain (service `tapo-power`); only the email is written to the config. If logins are still refused, turn on the Tapo app's **Me → Third-Party Services → Third-Party Compatibility** (not needed for this Matter-only strip; untested for account-bound ones).
 
-With an account stored, python-kasa tries it first and still falls back to the factory defaults, so a mix of owned and unowned strips works.
+Credentials are tried in order — stored account, then factory default — so a mix of owned and unowned strips works.
 
 ## CLI reference
 
@@ -146,7 +146,7 @@ timestamp,elapsed_s,strip,position,name,on,power_w,voltage_v,current_a
 | Meter refresh | A new reading every ~1.1 s (median 1.09 s, IQR 1.05–1.12 s, timed from mV voltage changes). This is the real ceiling: polling faster only repeats values, and at exactly 1 Hz ~8% of samples repeat. Each reading is averaged over that window, so short inrush peaks are smoothed away. |
 | Meter lag after switching | ~1.5–3 s, and the reading ramps rather than steps (measured on the earlier `tapo`-library backend; not yet re-measured). Don't use it for sub-second timing. |
 | Power factor | Power is real W; V × A is apparent VA. Small switching supplies show PF ≈ 0.5 (ArenaPS idles at ~0.48). |
-| Connect | ~1 s (KLAP handshake + first update); a `Strip` reuses the session afterwards |
+| Connect | ~3 s over TPAP (SPAKE2+ handshake), ~1 s over KLAP; a `Strip` reuses the session afterwards, so hold one open for loops and logging |
 | Switch latency | ~0.1–0.2 s including the confirming read-back |
 | Read throughput | `power()` on one outlet ~23 ms (~40 req/s); `sample()` one outlet ~150 ms, all 6 outlets ~250 ms (~4/s); `status` (adds energy) ~0.8 s. The network is never the bottleneck. |
 | Energy counters | today / month Wh per outlet (`status`). The strip also stores 5-minute average power per outlet (back to when it was powered up), not exposed by the CLI. |
@@ -157,7 +157,7 @@ Consequence for `--wait-above-w`: after switching on, the reading may stay near 
 
 ## Network notes
 
-- Control is HTTP (TCP 80, KLAP-encrypted) to the strip's IP, connecting with known protocol parameters, so it needs no UDP. Finding a moved strip uses mDNS (`<MAC>.local`) and UDP broadcast (ports 20002 and 9999); both only work on the same LAN segment. Direct control only needs routability.
+- Control is HTTP (TCP 80) to the strip's IP, encrypted with TPAP or KLAP. Each connect asks the strip which one it speaks (unicast UDP 20002 discovery, since firmware updates switch it); if UDP is blocked it tries TPAP then KLAP directly, so control needs no UDP. Finding a moved strip uses mDNS (`<MAC>.local`) and UDP broadcast (ports 20002 and 9999); both only work on the same LAN segment. Direct control only needs routability.
 - **Security:** a Matter-only strip accepts the published factory-default credentials, so anything on the same network can switch it. Fine at home; on shared networks (Janelia) prefer binding it to a TP-Link account (`login`) or an isolated IoT VLAN.
 - Janelia's managed Wi-Fi likely blocks the strip from joining or isolates clients; expect to need a lab-controlled network (e.g., a travel router on the bench). Broadcast discovery won't cross subnets — use `add NAME IP`.
 
@@ -165,11 +165,11 @@ Consequence for `--wait-above-w`: after switching on, the reading may stay near 
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Authentication failed at ...` | Strip is bound to a Tapo account, or the stored password is stale | `tapo-power login <email>` (user runs it); enable Third-Party Compatibility in the Tapo app |
 | `Cannot reach strip ... ` | IP changed and MAC re-discovery failed, strip offline, or different network | `tapo-power discover`; then `tapo-power add NAME NEW_IP` |
 | Discovery finds nothing but the strip works in Apple Home | Mac on a different subnet / VPN, or macOS Local Network permission denied | System Settings → Privacy & Security → Local Network → allow the terminal app / Claude; disconnect VPN |
-| `discover` lists nothing from the broadcast | Strip not answering TP-Link discovery, or on TPAP firmware (python-kasa drops those replies) | Configured strips are still found via mDNS (`found via mDNS`); for a new strip, `tapo-power add NAME IP` |
-| `refused the KLAP login (HTTP 403)` | Firmware update switched the strip to TP-Link's TPAP protocol (discovery reply shows `"encrypt_type": "TPAP"`); neither python-kasa 0.10.x nor `tapo` 0.10 supports it | Add the strip to the Tapo app, enable Me → Third-Party Services → Third-Party Compatibility (reverts to KLAP), then `tapo-power login <email>` |
+| `discover` lists nothing from the broadcast | Strip not answering TP-Link discovery | Configured strips are still found via mDNS (`found via mDNS`); for a new strip, `tapo-power add NAME IP` |
+| `refused the login` | Strip bound to a Tapo account (factory defaults no longer accepted), or stored password stale | `tapo-power login <email>` (user runs it) |
+| Worked, then stopped after a quiet firmware update | TP-Link firmware moved the strip from KLAP to TPAP (this P316M went 1.0.5 → 1.4.1 on its own, via Matter). Handled automatically; if python-kasa is ever downgraded to a release without TPAP, logins fail with `403 to handshake1` | Keep the pinned python-kasa commit until an official release includes TPAP |
 | Keychain "allow access" dialog | New Python interpreter reading the stored password (after a uv Python upgrade) | Click Always Allow |
 | Power reads 0 W right after `on` | Meter lag (see above) | Use `--wait-above-w` / `wait_for_power` rather than a single read |
 | `No outlet at position 7` / `Unknown outlet` | Typo or alias not set | `tapo-power status` lists names; `tapo-power alias NAME N` |
@@ -181,4 +181,4 @@ cd ~/Documents/GitHub/claude-skills/tapo-power
 uv run pytest tests -q          # fakes only — no network, no Keychain
 ```
 
-All python-kasa code lives in `tapo_power/strip.py`: `_open(host, creds)` returns a `_Connection` (child list, device info, per-outlet `_Plug` with `reading()` / `energy()` / `on()` / `off()`), and `_discover(target, timeout_s)` wraps broadcast discovery. Tests monkeypatch `_open`/`_discover` with fakes of that interface, and an autouse fixture blocks real network calls. `_Plug` sends the strip's own JSON methods (`get_emeter_data`, `get_energy_usage`) through python-kasa's authenticated protocol. Only P304M/P316M are accepted (`SUPPORTED_MODELS`, and `_CONNECTION` hard-codes their KLAP v2 parameters); other Tapo strips would need both relaxed.
+All python-kasa code lives in `tapo_power/strip.py`: `_open(host, creds)` returns a `_Connection` (child list, device info, per-outlet `_Plug` with `reading()` / `energy()` / `on()` / `off()`), and `_discover(target, timeout_s)` wraps broadcast discovery. Tests monkeypatch `_open`/`_discover` with fakes of that interface, and an autouse fixture blocks real network calls. `_Plug` sends the strip's own JSON methods (`get_emeter_data`, `get_energy_usage`) through python-kasa's authenticated protocol. Only P304M/P316M are accepted (`SUPPORTED_MODELS`; `_CONNECTIONS` lists their TPAP/KLAP parameters for the no-UDP fallback). python-kasa is pinned to a commit of its unreleased TPAP branch (PR #1592) in `pyproject.toml`; switch back to a PyPI release once one ships TPAP.

@@ -31,9 +31,12 @@ MDNS_TIMEOUT_S = 2
 SUPPORTED_MODELS = ("P304M", "P316M")
 CSV_FIELDS = ["timestamp", "elapsed_s", "strip", "position", "name", "on", "power_w", "voltage_v", "current_a"]
 
-# P304M/P316M speak KLAP v2 over HTTP. Connecting with known parameters skips
-# UDP discovery, so control still works where broadcasts can't reach.
-_CONNECTION = DeviceConnectionParameters(DeviceFamily.SmartTapoPlug, DeviceEncryptionType.Klap, login_version=2)
+# Firmware updates switch these strips from KLAP to TPAP. When UDP discovery
+# can't tell us which one a strip speaks, try each over plain HTTP.
+_CONNECTIONS = [
+    DeviceConnectionParameters(DeviceFamily.SmartTapoPlug, DeviceEncryptionType.Tpap, login_version=2),
+    DeviceConnectionParameters(DeviceFamily.SmartTapoPlug, DeviceEncryptionType.Klap, login_version=2),
+]
 
 Outlet = int | str
 
@@ -155,29 +158,60 @@ class _Connection:
         await self._dev.disconnect()
 
 
-async def _open(host: str, creds: tuple[str, str] | None) -> _Connection:
-    config = DeviceConfig(
-        host=host,
-        credentials=Credentials(*creds) if creds else None,
-        connection_type=_CONNECTION,
-        timeout=CONNECT_TIMEOUT_S,
-    )
+def _unreachable(e: BaseException) -> bool:
+    return any(isinstance(x, OSError) for x in (e, e.__cause__, *getattr(e, "args", ())))
+
+
+async def _connect_device(host: str, creds: Credentials) -> Device:
+    """Connect with whichever protocol the strip speaks: ask it via unicast
+    discovery, and if UDP is blocked, try each known protocol in turn."""
     try:
-        dev = await Device.connect(config=config)
-    except AuthenticationError as e:
-        raise TapoPowerError(
-            f"Authentication failed at {host}. If the strip was added to the Tapo app, "
-            f"store that account with `tapo-power login <email>`. ({e})"
-        ) from e
-    except Exception as e:
-        if "403" in str(e) and "handshake1" in str(e):
-            raise TapoPowerError(
-                f"The strip at {host} refused the KLAP login (HTTP 403). Newer firmware switches "
-                "these strips to TP-Link's TPAP protocol, which python-kasa doesn't support yet. Fix: add the "
-                "strip to the Tapo app, turn on Me -> Third-Party Services -> Third-Party Compatibility "
-                "(switches it back to KLAP), then `tapo-power login <email>`."
-            ) from e
+        dev = await Discover.discover_single(
+            host, credentials=creds, discovery_timeout=DISCOVERY_TIMEOUT_S, timeout=CONNECT_TIMEOUT_S
+        )
+    except AuthenticationError:
         raise
+    except Exception:
+        dev = None
+    if dev is not None:
+        try:
+            await dev.update()
+        except Exception:
+            with contextlib.suppress(Exception):
+                await dev.disconnect()
+            raise
+        return dev
+    last: Exception | None = None
+    for params in _CONNECTIONS:
+        config = DeviceConfig(host=host, credentials=creds, connection_type=params, timeout=CONNECT_TIMEOUT_S)
+        try:
+            return await Device.connect(config=config)
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            if _unreachable(e):
+                raise
+            last = e
+    raise last
+
+
+async def _open(host: str, creds: list[tuple[str, str]]) -> _Connection:
+    last_refusal: Exception | None = None
+    for user, password in creds:
+        try:
+            dev = await _connect_device(host, Credentials(user, password))
+            break
+        except AuthenticationError as e:
+            last_refusal = e
+        except Exception as e:
+            if not ("403" in str(e) and "handshake1" in str(e)):
+                raise
+            last_refusal = e
+    else:
+        raise TapoPowerError(
+            f"The strip at {host} refused the login. If it was added to the Tapo app, store that "
+            f"account with `tapo-power login <email>`. ({last_refusal})"
+        )
     if not dev.model.startswith(SUPPORTED_MODELS):
         await dev.disconnect()
         raise TapoPowerError(f"{host} is a {dev.model}; only {', '.join(SUPPORTED_MODELS)} strips are supported")

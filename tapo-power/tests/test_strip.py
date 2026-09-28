@@ -334,6 +334,13 @@ class FakeKasaDevice:
         self.protocol = FakeProtocol(responses or {})
         self._children = children or {}
         self.disconnected = False
+        self.updated = False
+        self.update_error: Exception | None = None
+
+    async def update(self):
+        if self.update_error is not None:
+            raise self.update_error
+        self.updated = True
 
     def get_child_device(self, device_id):
         return self._children[device_id]
@@ -342,57 +349,100 @@ class FakeKasaDevice:
         self.disconnected = True
 
 
-def _patch_connect(monkeypatch, result):
-    seen = {}
+def _patch_kasa(monkeypatch, *, discover, connect=None):
+    """Fake python-kasa entry points. `discover` is the result of
+    Discover.discover_single (a device, an exception, or a callable taking the
+    credentials); `connect` maps encryption name -> device or exception."""
+    calls = {"discover": [], "connect": []}
+
+    async def fake_discover_single(host, *, credentials=None, discovery_timeout=None, timeout=None):
+        calls["discover"].append(credentials.username)
+        r = discover(credentials) if callable(discover) else discover
+        if isinstance(r, Exception):
+            raise r
+        return r
 
     async def fake_connect(*, config):
-        seen["config"] = config
-        if isinstance(result, Exception):
-            raise result
-        return result
+        enc = config.connection_type.encryption_type.name
+        calls["connect"].append(enc)
+        r = (connect or {}).get(enc, KasaException(f"no fake for {enc}"))
+        if isinstance(r, Exception):
+            raise r
+        return r
 
+    monkeypatch.setattr(strip_mod.Discover, "discover_single", fake_discover_single)
     monkeypatch.setattr(strip_mod.Device, "connect", fake_connect)
-    return seen
+    return calls
 
 
-def test_open_passes_account_credentials(monkeypatch):
-    seen = _patch_connect(monkeypatch, FakeKasaDevice())
+def test_open_detects_protocol_via_discovery(monkeypatch):
+    dev = FakeKasaDevice()
+    calls = _patch_kasa(monkeypatch, discover=dev)
 
-    conn = asyncio.run(strip_mod._open(BENCH_HOST, ("me@x.com", "pw")))
+    conn = asyncio.run(strip_mod._open(BENCH_HOST, [("me@x.com", "pw")]))
 
     assert isinstance(conn, strip_mod._Connection)
-    assert seen["config"].host == BENCH_HOST
-    assert seen["config"].credentials.username == "me@x.com"
-    assert seen["config"].credentials.password == "pw"
+    assert dev.updated is True
+    assert calls == {"discover": ["me@x.com"], "connect": []}
 
 
-def test_open_without_account_passes_no_credentials(monkeypatch):
-    seen = _patch_connect(monkeypatch, FakeKasaDevice())
+def test_open_without_udp_tries_tpap_then_klap(monkeypatch):
+    dev = FakeKasaDevice()
+    calls = _patch_kasa(monkeypatch, discover=TimeoutError(),
+                        connect={"Tpap": KasaException("pake_register failed"), "Klap": dev})
 
-    asyncio.run(strip_mod._open(BENCH_HOST, None))
+    conn = asyncio.run(strip_mod._open(BENCH_HOST, [("test@tp-link.net", "test")]))
 
-    assert seen["config"].credentials is None
-
-
-def test_open_auth_failure_mentions_login(monkeypatch):
-    _patch_connect(monkeypatch, AuthenticationError("bad hash"))
-
-    with pytest.raises(TapoPowerError, match="tapo-power login"):
-        asyncio.run(strip_mod._open(BENCH_HOST, ("me@x.com", "wrong")))
+    assert isinstance(conn, strip_mod._Connection)
+    assert calls["connect"] == ["Tpap", "Klap"]
 
 
-def test_open_nonauth_error_propagates(monkeypatch):
-    _patch_connect(monkeypatch, KasaException("timed out"))
+def test_open_stops_trying_protocols_when_host_unreachable(monkeypatch):
+    calls = _patch_kasa(monkeypatch, discover=TimeoutError(),
+                        connect={"Tpap": KasaException("Unable to query the device", TimeoutError())})
 
     with pytest.raises(KasaException):
-        asyncio.run(strip_mod._open(BENCH_HOST, None))
+        asyncio.run(strip_mod._open(BENCH_HOST, [("test@tp-link.net", "test")]))
+    assert calls["connect"] == ["Tpap"]
 
 
-def test_open_klap_403_explains_tpap(monkeypatch):
-    _patch_connect(monkeypatch, KasaException("Device 10.0.0.5 responded with 403 to handshake1"))
+def test_open_falls_back_to_next_credentials_after_refusal(monkeypatch):
+    dev = FakeKasaDevice()
+    calls = _patch_kasa(
+        monkeypatch,
+        discover=lambda creds: AuthenticationError("bad") if creds.username == "me@x.com" else dev,
+    )
 
-    with pytest.raises(TapoPowerError, match="Third-Party Compatibility"):
-        asyncio.run(strip_mod._open(BENCH_HOST, None))
+    asyncio.run(strip_mod._open(BENCH_HOST, [("me@x.com", "wrong"), ("test@tp-link.net", "test")]))
+
+    assert calls["discover"] == ["me@x.com", "test@tp-link.net"]
+
+
+def test_open_all_refused_mentions_login(monkeypatch):
+    _patch_kasa(monkeypatch, discover=AuthenticationError("bad hash"))
+
+    with pytest.raises(TapoPowerError, match="tapo-power login"):
+        asyncio.run(strip_mod._open(BENCH_HOST, [("me@x.com", "wrong"), ("test@tp-link.net", "test")]))
+
+
+def test_open_klap_403_counts_as_refusal(monkeypatch):
+    _patch_kasa(monkeypatch, discover=TimeoutError(), connect={
+        "Tpap": KasaException("pake_register failed"),
+        "Klap": KasaException("Device 10.0.0.5 responded with 403 to handshake1"),
+    })
+
+    with pytest.raises(TapoPowerError, match="refused the login"):
+        asyncio.run(strip_mod._open(BENCH_HOST, [("test@tp-link.net", "test")]))
+
+
+def test_open_update_failure_disconnects(monkeypatch):
+    dev = FakeKasaDevice()
+    dev.update_error = KasaException("boom")
+    _patch_kasa(monkeypatch, discover=dev)
+
+    with pytest.raises(KasaException, match="boom"):
+        asyncio.run(strip_mod._open(BENCH_HOST, [("test@tp-link.net", "test")]))
+    assert dev.disconnected is True
 
 
 def test_connect_failure_after_rediscovery_is_a_clean_error(monkeypatch, tmp_path, plugs):
@@ -419,10 +469,10 @@ def test_connect_failure_after_rediscovery_is_a_clean_error(monkeypatch, tmp_pat
 
 def test_open_rejects_unsupported_model_and_disconnects(monkeypatch):
     dev = FakeKasaDevice(model="P110M")
-    _patch_connect(monkeypatch, dev)
+    _patch_kasa(monkeypatch, discover=dev)
 
     with pytest.raises(TapoPowerError, match="P110M"):
-        asyncio.run(strip_mod._open(BENCH_HOST, None))
+        asyncio.run(strip_mod._open(BENCH_HOST, [("test@tp-link.net", "test")]))
     assert dev.disconnected is True
 
 

@@ -40,7 +40,7 @@ ln -s "$(pwd)/codex-plan-review" ~/.claude/skills/codex-plan-review
 - **kicad-design-review** requires Python 3.10+ and `kiutils` (installed via `pyproject.toml` in the skill directory).
 - **nano-banana-artwork** requires a Google AI Studio API key (`GOOGLE_GENAI_API_KEY`).
 - **pdf-sidecar** requires `uv` (for PEP 723 inline-deps). The default invocation is `uv run --script --with marker-pdf bin/pdf-sidecar.py paper.pdf`; `--high-fidelity` uses Docling instead (`--with docling`). Both backends are pulled lazily — only `pypdf` is in the script's PEP 723 header (used for the cheap baseline pass that detects scanned PDFs and seeds verification).
-- **tapo-power** requires `uv` (the `bin/tapo-power` wrapper runs the package from its own `.venv/`) and a strip reachable on the local network. Credentials: none for Matter-only strips; account-bound strips need `tapo-power login` (password stored in the macOS Keychain).
+- **tapo-power** requires `uv` (the `bin/tapo-power` wrapper runs the package from its own `.venv/`; python-kasa is pinned to its unreleased TPAP branch, fetched from GitHub on first sync) and a strip reachable on the local network. Credentials: none for Matter-only strips; account-bound strips need `tapo-power login` (password stored in the macOS Keychain).
 
 Skills that need additional setup describe it in their own `SKILL.md` body.
 
