@@ -8,6 +8,7 @@ import contextlib
 import csv
 import logging
 import re
+import socket
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -26,6 +27,7 @@ logger = logging.getLogger("tapo_power")
 
 CONNECT_TIMEOUT_S = 5
 DISCOVERY_TIMEOUT_S = 3
+MDNS_TIMEOUT_S = 2
 SUPPORTED_MODELS = ("P304M", "P316M")
 CSV_FIELDS = ["timestamp", "elapsed_s", "strip", "position", "name", "on", "power_w", "voltage_v", "current_a"]
 
@@ -167,6 +169,15 @@ async def _open(host: str, creds: tuple[str, str] | None) -> _Connection:
             f"Authentication failed at {host}. If the strip was added to the Tapo app, "
             f"store that account with `tapo-power login <email>`. ({e})"
         ) from e
+    except Exception as e:
+        if "403" in str(e) and "handshake1" in str(e):
+            raise TapoPowerError(
+                f"The strip at {host} refused the KLAP login (HTTP 403). Newer firmware switches "
+                "these strips to TP-Link's TPAP protocol, which python-kasa doesn't support yet. Fix: add the "
+                "strip to the Tapo app, turn on Me -> Third-Party Services -> Third-Party Compatibility "
+                "(switches it back to KLAP), then `tapo-power login <email>`."
+            ) from e
+        raise
     if not dev.model.startswith(SUPPORTED_MODELS):
         await dev.disconnect()
         raise TapoPowerError(f"{host} is a {dev.model}; only {', '.join(SUPPORTED_MODELS)} strips are supported")
@@ -196,6 +207,36 @@ async def _discover(target: str, timeout_s: int) -> list[dict]:
 def discover(target: str = "255.255.255.255", timeout_s: int = DISCOVERY_TIMEOUT_S) -> list[dict]:
     """Broadcast TP-Link discovery (UDP 20002/9999). Needs no credentials."""
     return _run_isolated(_discover(target, timeout_s))
+
+
+async def _resolve_mdns(mac: str, timeout_s: float = MDNS_TIMEOUT_S) -> str | None:
+    """Matter devices keep advertising <MAC>.local over mDNS; return its current IPv4."""
+    loop = asyncio.get_running_loop()
+    name = f"{_norm_mac(mac).upper()}.local"
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(name, 80, family=socket.AF_INET, type=socket.SOCK_STREAM), timeout_s
+        )
+    except OSError:  # includes TimeoutError
+        return None
+    return infos[0][4][0] if infos else None
+
+
+async def _find_by_mac(mac: str) -> str | None:
+    """Current IP for a MAC: mDNS first (fast, reliable for Matter strips), then
+    TP-Link broadcast discovery, which sometimes goes unanswered — so tried twice."""
+    if ip := await _resolve_mdns(mac):
+        return ip
+    want = _norm_mac(mac)
+    for _ in range(2):
+        for d in await _discover("255.255.255.255", DISCOVERY_TIMEOUT_S):
+            if _norm_mac(d["mac"] or "") == want:
+                return d["ip"]
+    return None
+
+
+def find_by_mac(mac: str) -> str | None:
+    return _run_isolated(_find_by_mac(mac))
 
 
 class Strip:
@@ -290,27 +331,24 @@ class Strip:
         new_host = await self._rediscover()
         if new_host is None:
             raise TapoPowerError(f"Cannot reach strip {self.name!r} at {self._cfg.host}: {err}")
-        self._handler = await _open(new_host, self._creds)
+        try:
+            self._handler = await _open(new_host, self._creds)
+        except TapoPowerError:
+            raise
+        except Exception as e:
+            raise TapoPowerError(f"Found strip {self.name!r} at {new_host} but could not connect: {e}") from e
 
     async def _rediscover(self) -> str | None:
         if not self._cfg.mac:
             return None
-        want = _norm_mac(self._cfg.mac)
-        # Discovery is one UDP broadcast; replies occasionally drop, so try twice.
-        for _ in range(2):
-            ips = [d["ip"] for d in await _discover("255.255.255.255", DISCOVERY_TIMEOUT_S)
-                   if _norm_mac(d["mac"] or "") == want]
-            if ips:
-                break
-        else:
+        ip = await _find_by_mac(self._cfg.mac)
+        if ip is None or ip == self._cfg.host:
             return None
-        if ips[0] == self._cfg.host:
-            return None
-        logger.warning("%s moved %s -> %s", self.name, self._cfg.host, ips[0])
-        self._cfg.host = ips[0]
+        logger.warning("%s moved %s -> %s", self.name, self._cfg.host, ip)
+        self._cfg.host = ip
         if self._persist:
             self._config.save()
-        return ips[0]
+        return ip
 
     async def _children(self) -> list[dict]:
         self._kids = await self._handler.children()

@@ -67,7 +67,20 @@ def test_discover_json_prints_discovered_list(cli_config, monkeypatch, capsys):
 
     assert rc == 0
     data = json.loads(capsys.readouterr().out)
-    assert data == fake_found
+    assert data == [dict(fake_found[0], via="broadcast", configured_as="bench")]
+
+
+def test_discover_finds_moved_strip_via_mdns_and_updates_config(cli_config, monkeypatch, capsys):
+    monkeypatch.setattr(cli_mod, "discover", lambda **kwargs: [])
+    monkeypatch.setattr(cli_mod, "find_by_mac", lambda mac: "10.0.0.33")
+
+    rc = cli_mod.main(["discover"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "found via mDNS" in out
+    assert "10.0.0.5 -> 10.0.0.33" in out
+    assert json.loads(cli_config.read_text())["strips"]["bench"]["host"] == "10.0.0.33"
 
 
 def test_on_arena_json_reports_state_and_position(monkeypatch, tmp_path, patch_open, patch_discover_empty, capsys):

@@ -43,7 +43,7 @@ tapo-power alias ArenaPS 6             # name outlet 6
 tapo-power unalias ArenaPS
 ```
 
-`add` stores the IP and MAC. If the IP later changes (DHCP), a failed connection triggers a discovery broadcast, the strip is re-found by MAC, and the new IP is saved automatically. A DHCP reservation on the router is still the robust fix.
+`add` stores the IP and MAC. If the IP later changes (DHCP), the first failed connection (~5 s timeout) re-finds the strip by MAC and saves the new IP: first via mDNS — Matter strips continuously advertise `<MAC>.local` (e.g. `58D812141B6F.local`), which resolves in milliseconds — then via TP-Link's UDP broadcast, which strips sometimes stop answering. `tapo-power discover` does the same lookup for every configured strip and updates moved ones. A DHCP reservation on the router is still the robust fix.
 
 Config format (hand-editable):
 
@@ -157,7 +157,7 @@ Consequence for `--wait-above-w`: after switching on, the reading may stay near 
 
 ## Network notes
 
-- Control is HTTP (TCP 80, KLAP-encrypted) to the strip's IP, connecting with known protocol parameters, so it needs no UDP. Discovery is UDP broadcast (ports 20002 and 9999) and only works on the same LAN segment; direct control only needs routability.
+- Control is HTTP (TCP 80, KLAP-encrypted) to the strip's IP, connecting with known protocol parameters, so it needs no UDP. Finding a moved strip uses mDNS (`<MAC>.local`) and UDP broadcast (ports 20002 and 9999); both only work on the same LAN segment. Direct control only needs routability.
 - **Security:** a Matter-only strip accepts the published factory-default credentials, so anything on the same network can switch it. Fine at home; on shared networks (Janelia) prefer binding it to a TP-Link account (`login`) or an isolated IoT VLAN.
 - Janelia's managed Wi-Fi likely blocks the strip from joining or isolates clients; expect to need a lab-controlled network (e.g., a travel router on the bench). Broadcast discovery won't cross subnets — use `add NAME IP`.
 
@@ -168,7 +168,8 @@ Consequence for `--wait-above-w`: after switching on, the reading may stay near 
 | `Authentication failed at ...` | Strip is bound to a Tapo account, or the stored password is stale | `tapo-power login <email>` (user runs it); enable Third-Party Compatibility in the Tapo app |
 | `Cannot reach strip ... ` | IP changed and MAC re-discovery failed, strip offline, or different network | `tapo-power discover`; then `tapo-power add NAME NEW_IP` |
 | Discovery finds nothing but the strip works in Apple Home | Mac on a different subnet / VPN, or macOS Local Network permission denied | System Settings → Privacy & Security → Local Network → allow the terminal app / Claude; disconnect VPN |
-| `discover` occasionally returns nothing | Discovery is a single UDP broadcast; replies sometimes drop | Rerun it (automatic IP re-find already tries twice) |
+| `discover` lists nothing from the broadcast | Strip not answering TP-Link discovery, or on TPAP firmware (python-kasa drops those replies) | Configured strips are still found via mDNS (`found via mDNS`); for a new strip, `tapo-power add NAME IP` |
+| `refused the KLAP login (HTTP 403)` | Firmware update switched the strip to TP-Link's TPAP protocol (discovery reply shows `"encrypt_type": "TPAP"`); neither python-kasa 0.10.x nor `tapo` 0.10 supports it | Add the strip to the Tapo app, enable Me → Third-Party Services → Third-Party Compatibility (reverts to KLAP), then `tapo-power login <email>` |
 | Keychain "allow access" dialog | New Python interpreter reading the stored password (after a uv Python upgrade) | Click Always Allow |
 | Power reads 0 W right after `on` | Meter lag (see above) | Use `--wait-above-w` / `wait_for_power` rather than a single read |
 | `No outlet at position 7` / `Unknown outlet` | Typo or alias not set | `tapo-power status` lists names; `tapo-power alias NAME N` |

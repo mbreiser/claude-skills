@@ -7,6 +7,7 @@ from tapo_power.config import Config, StripConfig
 
 BENCH_MAC = "58-D8-12-14-1B-6F"
 BENCH_HOST = "10.0.0.5"
+REAL_RESOLVE_MDNS = strip_mod._resolve_mdns
 
 
 class FakePlug:
@@ -96,6 +97,11 @@ def _isolate(monkeypatch, tmp_path):
 
     monkeypatch.setattr(strip_mod.Device, "connect", no_network)
     monkeypatch.setattr(strip_mod.Discover, "discover", no_network)
+
+    async def no_mdns(mac, timeout_s=None):
+        return None
+
+    monkeypatch.setattr(strip_mod, "_resolve_mdns", no_mdns)
 
 
 @pytest.fixture

@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict
 
 from .config import Config, StripConfig, TapoPowerError, store_password
-from .strip import SUPPORTED_MODELS, OutletStatus, Strip, StripStatus, WaitTimeout, discover
+from .strip import SUPPORTED_MODELS, OutletStatus, Strip, StripStatus, WaitTimeout, _norm_mac, discover, find_by_mac
 
 EXIT_ERROR = 1
 EXIT_USAGE = 2
@@ -55,18 +55,42 @@ def _open_strip(args, cfg: Config) -> Strip:
 
 
 def cmd_discover(args, cfg):
-    found = discover(timeout_s=args.timeout)
+    """Broadcast discovery, plus an mDNS lookup of every configured strip; a
+    configured strip found at a new IP has its saved host updated."""
+    found = [dict(d, via="broadcast") for d in discover(timeout_s=args.timeout)]
+    by_mac = {_norm_mac(d["mac"] or ""): d for d in found}
+    moved = []
+    for name, sc in cfg.strips.items():
+        if not sc.mac:
+            continue
+        d = by_mac.get(_norm_mac(sc.mac))
+        if d is None:
+            ip = find_by_mac(sc.mac)
+            if ip is None:
+                continue
+            d = {"ip": ip, "model": None, "mac": sc.mac, "device_id": None, "owner_bound": None,
+                 "onboarded_via": None, "via": "mdns"}
+            found.append(d)
+        d["configured_as"] = name
+        if d["ip"] != sc.host:
+            moved.append((name, sc.host, d["ip"]))
+            sc.host = d["ip"]
+    if moved:
+        cfg.save()
     if args.json:
         _print_json(found)
         return
     if not found:
-        print("No Tapo devices answered discovery (UDP 20002 broadcast).")
-        return
-    known = {s.host: n for n, s in cfg.strips.items()}
+        print("No Tapo devices found (UDP broadcast, and mDNS for configured strips).")
     for d in found:
-        tag = f"  [configured as {known[d['ip']]!r}]" if d["ip"] in known else ""
-        owner = "account-bound" if d["owner_bound"] else "no account"
-        print(f"{d['ip']:<15}  {d['model']:<12}  mac {d['mac']}  {owner}, onboarded via {d['onboarded_via']}{tag}")
+        tag = f"  [configured as {d['configured_as']!r}]" if "configured_as" in d else ""
+        if d["via"] == "mdns":
+            print(f"{d['ip']:<15}  {'?':<12}  mac {d['mac']}  found via mDNS (no broadcast reply){tag}")
+        else:
+            owner = "account-bound" if d["owner_bound"] else "no account"
+            print(f"{d['ip']:<15}  {d['model']:<12}  mac {d['mac']}  {owner}, onboarded via {d['onboarded_via']}{tag}")
+    for name, old, new in moved:
+        print(f"Updated {name!r}: {old} -> {new}")
 
 
 def cmd_add(args, cfg):

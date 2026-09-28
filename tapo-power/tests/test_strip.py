@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import socket
 import time
 
 import pytest
@@ -13,7 +14,7 @@ from tapo_power.strip import OutletStatus, Strip, WaitTimeout
 
 from kasa.exceptions import AuthenticationError, KasaException
 
-from conftest import BENCH_HOST, FakeHandler
+from conftest import BENCH_HOST, REAL_RESOLVE_MDNS, FakeHandler
 
 # --- outlet resolution ----------------------------------------------------
 
@@ -232,6 +233,58 @@ def test_rediscover_switches_host_and_saves_config(monkeypatch, tmp_path, plugs)
     assert saved["strips"]["bench"]["host"] == "10.0.0.9"
 
 
+def test_rediscover_prefers_mdns_over_broadcast(monkeypatch, tmp_path, plugs):
+    import tapo_power.config as config_mod
+
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", config_path)
+    handler = FakeHandler(plugs, ip="10.0.0.33")
+
+    async def fake_open(host, creds):
+        if host == BENCH_HOST:
+            raise OSError("unreachable")
+        return handler
+
+    async def fake_mdns(mac, timeout_s=None):
+        assert mac == "58-D8-12-14-1B-6F"
+        return "10.0.0.33"
+
+    async def broadcast_must_not_run(target, timeout_s):
+        raise AssertionError("broadcast discovery used although mDNS answered")
+
+    monkeypatch.setattr(strip_mod, "_open", fake_open)
+    monkeypatch.setattr(strip_mod, "_resolve_mdns", fake_mdns)
+    monkeypatch.setattr(strip_mod, "_discover", broadcast_must_not_run)
+
+    cfg = Config(default="bench", strips={"bench": StripConfig(name="bench", host=BENCH_HOST, mac="58-D8-12-14-1B-6F")})
+    with Strip(config=cfg) as s:
+        s.outlets()
+        assert s.host == "10.0.0.33"
+    assert json.loads(config_path.read_text())["strips"]["bench"]["host"] == "10.0.0.33"
+
+
+def test_resolve_mdns_queries_uppercase_mac_hostname(monkeypatch):
+    seen = {}
+
+    def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        seen["host"] = host
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.4.33", 80))]
+
+    monkeypatch.setattr(strip_mod.socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert asyncio.run(REAL_RESOLVE_MDNS("58-d8-12-14-1b-6f")) == "192.168.4.33"
+    assert seen["host"] == "58D812141B6F.local"
+
+
+def test_resolve_mdns_returns_none_when_unresolvable(monkeypatch):
+    def fail(*a, **kw):
+        raise socket.gaierror("nodename nor servname provided")
+
+    monkeypatch.setattr(strip_mod.socket, "getaddrinfo", fail)
+
+    assert asyncio.run(REAL_RESOLVE_MDNS("58-D8-12-14-1B-6F")) is None
+
+
 def test_adhoc_host_strip_does_not_save_config_on_rediscover(monkeypatch, tmp_path, plugs):
     import tapo_power.config as config_mod
 
@@ -333,6 +386,35 @@ def test_open_nonauth_error_propagates(monkeypatch):
 
     with pytest.raises(KasaException):
         asyncio.run(strip_mod._open(BENCH_HOST, None))
+
+
+def test_open_klap_403_explains_tpap(monkeypatch):
+    _patch_connect(monkeypatch, KasaException("Device 10.0.0.5 responded with 403 to handshake1"))
+
+    with pytest.raises(TapoPowerError, match="Third-Party Compatibility"):
+        asyncio.run(strip_mod._open(BENCH_HOST, None))
+
+
+def test_connect_failure_after_rediscovery_is_a_clean_error(monkeypatch, tmp_path, plugs):
+    import tapo_power.config as config_mod
+
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "config.json")
+
+    async def fake_open(host, creds):
+        if host == BENCH_HOST:
+            raise OSError("unreachable")
+        raise RuntimeError("new host misbehaves")
+
+    async def fake_mdns(mac, timeout_s=None):
+        return "10.0.0.33"
+
+    monkeypatch.setattr(strip_mod, "_open", fake_open)
+    monkeypatch.setattr(strip_mod, "_resolve_mdns", fake_mdns)
+
+    cfg = Config(default="bench", strips={"bench": StripConfig(name="bench", host=BENCH_HOST, mac="58-D8-12-14-1B-6F")})
+    with Strip(config=cfg) as s:
+        with pytest.raises(TapoPowerError, match="Found strip 'bench' at 10.0.0.33"):
+            s.outlets()
 
 
 def test_open_rejects_unsupported_model_and_disconnects(monkeypatch):
