@@ -188,3 +188,17 @@ def test_log_best_effort_exits_zero_when_nothing_reachable(saved, capsys, fakes,
                      "--interval-s", "0.01", "--retry-s", "0.02", "--duration-s", "0.1")
 
     assert rc == 0 and "Wrote 0 samples" in out
+
+
+def test_log_stops_when_stdin_closes(saved, capsys, monkeypatch, tmp_path):
+    import io
+    import time
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))  # parent already gone: immediate EOF
+    t = time.monotonic()
+
+    rc, out, _ = run(capsys, "log", "BenchPlug", "--out", str(tmp_path / "p.csv"), "--stop-on-eof",
+                     "--interval-s", "0.01", "--duration-s", "10")
+
+    assert rc == 0 and "Wrote" in out
+    assert time.monotonic() - t < 2

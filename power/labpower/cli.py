@@ -7,6 +7,7 @@ import json
 import logging
 import signal
 import sys
+import threading
 from dataclasses import asdict
 
 from .config import Config, DeviceEntry, PowerError, WaitTimeout, alias_targets, store_tapo_password
@@ -152,10 +153,26 @@ def _sigterm_as_interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
+def _stop_when_stdin_closes(stop: threading.Event) -> None:
+    """For a parent that keeps a pipe to our stdin: the pipe closes when the
+    parent exits for any reason (even SIGKILL), so the logger can't be orphaned."""
+
+    def watch():
+        with contextlib.suppress(Exception):
+            while sys.stdin.read(4096):
+                pass
+        stop.set()
+
+    threading.Thread(target=watch, daemon=True, name="stdin-eof").start()
+
+
 def cmd_log(args, cfg):
     signal.signal(signal.SIGTERM, _sigterm_as_interrupt)  # lets a parent process stop the logger cleanly
+    stop = threading.Event()
+    if args.stop_on_eof:
+        _stop_when_stdin_closes(stop)
     kwargs = dict(interval_s=args.interval_s, duration_s=args.duration_s, outlets=args.outlets or None,
-                  best_effort=args.best_effort, retry_s=args.retry_s)
+                  best_effort=args.best_effort, retry_s=args.retry_s, stop=stop)
     with Power(cfg) as p:
         if args.out is None:
             p.log_csv(sys.stdout, **kwargs)
@@ -389,6 +406,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--best-effort", action="store_true",
                    help="never fail: retry unreachable outlets, fail over fallback aliases, exit 0")
     s.add_argument("--retry-s", type=float, default=30.0, help="best-effort retry period (default 30)")
+    s.add_argument("--stop-on-eof", action="store_true",
+                   help="stop when stdin closes; a parent holding a pipe to stdin can't leave an orphaned logger")
     s.set_defaults(fn=cmd_log)
 
     s = sub.add_parser("discover", help="find Tapo strips on the LAN and devices paired with Zigbee2MQTT")

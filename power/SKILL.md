@@ -111,7 +111,7 @@ power log ArenaPS BenchPlug --out run.csv --interval-s 1 --duration-s 3600
 
 Exit codes: `0` ok · `1` device / network / auth / unknown-outlet error (message on stderr) · `2` bad arguments · `3` `--wait-above-w` not reached before timeout · `130` Ctrl-C. `status` exits 1 only if no device is reachable.
 
-`log --out` appends (header only for a new file), flushes every sample, and shows a live readout on stderr in a terminal. Devices are sampled in parallel; a device that fails a sample is skipped for that sample with a warning, and the rest keep logging. SIGTERM stops it cleanly (for callers running it as a subprocess).
+`log --out` appends (header only for a new file), flushes every sample, and shows a live readout on stderr in a terminal. Devices are sampled in parallel; a device that fails a sample is skipped for that sample with a warning, and the rest keep logging. SIGTERM stops it cleanly, and `--stop-on-eof` stops it when its stdin closes — a parent that keeps a pipe to the logger's stdin can never leave it orphaned, even if the parent is SIGKILLed (verified).
 
 **Best-effort logging** — `power log G6Arena --out run.csv --best-effort` (Python: `log_csv(..., best_effort=True)` / `background_log(..., best_effort=True)`) is for logging alongside something more important. It never fails the caller: unresolvable or unreachable outlets are retried every `--retry-s` (30 s), fallback aliases fail over on the next sample and move back to the preferred target when it answers again, nothing reachable just leaves a header-only CSV, and the exit code is 0. Measured failover (stopping Zigbee2MQTT mid-log with `G6Arena` = BenchPlug → strip outlet 1): 99 rows in 99 s, largest gap 2.1 s, back on BenchPlug 3 s after Zigbee2MQTT restarted. The `device` column records which meter each row came from.
 
@@ -148,8 +148,8 @@ with Power() as p:                                  # uses ~/.config/power/confi
 ## Using it from other projects (G6 firmware, webDisplayTools, …)
 
 - **Name outlets by role, not device.** Project code only says `G6Arena`; each machine's `~/.config/power/config.json` maps that to whatever is there (fallback list included). Nothing device-specific goes in the project.
-- **Prefer the CLI as a subprocess** for projects with their own environments (pixi, MATLAB): no dependency to add, and a missing skill or missing device can't break the project. Start `~/.claude/skills/power/bin/power log G6Arena --out <run>-power.csv --best-effort` next to the run; send SIGTERM at the end. Check the path exists first and skip power logging if not — collaborators without the skill are unaffected.
-- **For a Python dependency, pin a tag**, never `main`: `labpower @ git+https://github.com/mbreiser/claude-skills@power-v0.5.0#subdirectory=power`. Guard the import (`try: from labpower import Power` / `except ImportError: Power = None`) and use `best_effort=True`.
+- **Prefer the CLI as a subprocess** for projects with their own environments (pixi, MATLAB): no dependency to add, and a missing skill or missing device can't break the project. Start `~/.claude/skills/power/bin/power log G6Arena --out <run>-power.csv --best-effort --stop-on-eof` with `stdin=PIPE` next to the run and close the pipe to stop it (SIGTERM also works). Check the path exists first and skip power logging if not — collaborators without the skill are unaffected. Working examples: `tests/power_log.py` in LED-Display_G6_Firmware_Arena and `fictrac-bridge/power_log.py` in webDisplayTools.
+- **For a Python dependency, pin a tag**, never `main`: `labpower @ git+https://github.com/mbreiser/claude-skills@power-v0.5.1#subdirectory=power`. Guard the import (`try: from labpower import Power` / `except ImportError: Power = None`) and use `best_effort=True`.
 
 ## MATLAB
 

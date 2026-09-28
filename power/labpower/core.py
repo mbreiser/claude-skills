@@ -326,7 +326,9 @@ class Power:
                 logger.warning("%s", msg)
 
         if best_effort:
-            self._warm_up(outlets)
+            # In the background: sampling starts on the preferred target at once,
+            # while fallback devices (e.g. a ~3 s Tapo handshake) get connected.
+            self._pool.submit(self._warm_up, outlets)
         t0 = time.monotonic()
         next_t = t0
         n = 0

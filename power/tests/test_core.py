@@ -305,6 +305,7 @@ def test_best_effort_log_warms_up_fallback_devices(g6, fakes, monkeypatch):
         orig = fake.channels
         monkeypatch.setattr(fake, "channels", lambda orig=orig, name=name: probed.append(name) or orig())
 
-    g6.log_csv(io.StringIO(), interval_s=0.01, duration_s=0.02, outlets=["G6Arena"], best_effort=True)
+    g6.log_csv(io.StringIO(), interval_s=0.01, duration_s=0.05, outlets=["G6Arena"], best_effort=True)
+    time.sleep(0.05)  # warm-up runs in the background
 
     assert {"BenchPlug", "Strip"} <= set(probed)
