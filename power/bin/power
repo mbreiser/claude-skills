@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-exec uv run --quiet --project "$SKILL_DIR" tapo-power "$@"
+exec uv run --quiet --project "$SKILL_DIR" power "$@"

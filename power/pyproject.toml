@@ -1,16 +1,17 @@
 [project]
-name = "tapo-power"
-version = "0.3.0"
-description = "Local control and power/voltage/current monitoring for TP-Link Tapo P316M / P304M smart power strips"
+name = "labpower"
+version = "0.4.0"
+description = "Switch, power-cycle, and measure lab power outlets: Tapo P316M/P304M strips and Zigbee2MQTT plugs"
 requires-python = ">=3.11"
 dependencies = [
     # TPAP support is unreleased (python-kasa PR #1592); pinned to a tested commit.
     "python-kasa @ git+https://github.com/ZeliardM/python-kasa@e7084472972f08f2e2235b342f3964aedbfaeb3b",
+    "paho-mqtt>=2.1,<3",
     "keyring>=25",
 ]
 
 [project.scripts]
-tapo-power = "tapo_power.cli:main"
+power = "labpower.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
@@ -23,4 +24,4 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["tapo_power"]
+packages = ["labpower"]

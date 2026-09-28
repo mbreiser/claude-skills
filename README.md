@@ -31,7 +31,7 @@ ln -s "$(pwd)/codex-plan-review" ~/.claude/skills/codex-plan-review
 | [nano-banana-artwork](nano-banana-artwork/) | Generate consistent character artwork via Google's Nano Banana Pro (gemini-3-pro-image-preview). Themed posters, logos, character sets with cross-image consistency. |
 | [kicad-design-review](kicad-design-review/) | KiCad PCB schematic review. Python extractor produces deterministic structured facts (BOM × netlist × schematic × positions, with confidence flags); skill synthesizes the human-readable design-review report. |
 | [pdf-sidecar](pdf-sidecar/) | Extract a PDF into a cached sidecar of markdown + images so Claude reads the markdown instead of paying tokens to re-read the raw PDF on every session. Marker backend by default, Docling on `--high-fidelity`. Built-in verification gate compares baseline word/image counts against what the backend actually emitted. |
-| [tapo-power](tapo-power/) | Local-network control of a TP-Link Tapo P316M/P304M smart power strip via python-kasa: per-outlet on/off, power-cycle with wait-for-boot, per-outlet power / current / voltage and energy, CSV logging. CLI plus an importable `tapo_power` Python module for other projects. |
+| [power](power/) | Switch, power-cycle, and measure lab power outlets across devices — Tapo P316M strips over the LAN (python-kasa) and Zigbee plugs via Zigbee2MQTT — with shared outlet aliases, wait-for-boot cycling, per-outlet W/V/A, and CSV logging. CLI plus an importable `labpower` Python module. |
 
 ## Dependencies
 
@@ -40,7 +40,7 @@ ln -s "$(pwd)/codex-plan-review" ~/.claude/skills/codex-plan-review
 - **kicad-design-review** requires Python 3.10+ and `kiutils` (installed via `pyproject.toml` in the skill directory).
 - **nano-banana-artwork** requires a Google AI Studio API key (`GOOGLE_GENAI_API_KEY`).
 - **pdf-sidecar** requires `uv` (for PEP 723 inline-deps). The default invocation is `uv run --script --with marker-pdf bin/pdf-sidecar.py paper.pdf`; `--high-fidelity` uses Docling instead (`--with docling`). Both backends are pulled lazily — only `pypdf` is in the script's PEP 723 header (used for the cheap baseline pass that detects scanned PDFs and seeds verification).
-- **tapo-power** requires `uv` (the `bin/tapo-power` wrapper runs the package from its own `.venv/`; python-kasa is pinned to its unreleased TPAP branch, fetched from GitHub on first sync) and a strip reachable on the local network. Credentials: none for Matter-only strips; account-bound strips need `tapo-power login` (password stored in the macOS Keychain).
+- **power** requires `uv` (the `bin/power` wrapper runs the package from its own `.venv/`; python-kasa is pinned to its unreleased TPAP branch, fetched from GitHub on first sync). Tapo strips need to be reachable on the LAN. Zigbee plugs need a Zigbee coordinator dongle plus Mosquitto and Zigbee2MQTT running locally (setup in the skill's `SKILL.md`).
 
 Skills that need additional setup describe it in their own `SKILL.md` body.
 

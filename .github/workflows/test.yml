@@ -70,9 +70,9 @@ jobs:
           uv run --python ${{ matrix.python-version }} \
             --script bin/pdf-sidecar.py --help
 
-  # tapo-power tests — the device seam (_open/_discover) is faked, so no
-  # network, power strip, or Keychain is touched in CI.
-  tapo-power:
+  # power tests — device, MQTT, and Keychain seams are faked, so no
+  # network, power device, or broker is touched in CI.
+  power:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -88,10 +88,10 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Run pytest (tapo-power)
-        working-directory: tapo-power
+      - name: Run pytest (power)
+        working-directory: power
         run: uv run --python ${{ matrix.python-version }} --project . pytest tests -v
 
       - name: Smoke-test CLI --help
-        working-directory: tapo-power
-        run: uv run --python ${{ matrix.python-version }} --project . tapo-power --help
+        working-directory: power
+        run: uv run --python ${{ matrix.python-version }} --project . power --help
