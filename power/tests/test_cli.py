@@ -156,3 +156,35 @@ def test_discover_reports_missing_broker(saved, capsys, monkeypatch):
     rc, out, _ = run(capsys, "discover")
 
     assert rc == 0 and "unavailable: Can't reach the MQTT broker" in out
+
+
+def test_alias_with_fallbacks_stores_a_list(saved, capsys):
+    rc, out, _ = run(capsys, "alias", "G6Arena", "BenchPlug", "Strip:1")
+
+    assert rc == 0 and "first reachable wins" in out
+    assert json.loads(saved.read_text())["aliases"]["G6Arena"] == ["BenchPlug:1", "Strip:1"]
+
+
+def test_alias_fallback_target_may_be_offline(saved, capsys, fakes):
+    fakes["Strip"].fail = "down"
+    rc, _, _ = run(capsys, "alias", "G6Arena", "BenchPlug", "Strip:1")
+    assert rc == 0
+
+
+def test_remove_prunes_fallback_lists(saved, capsys):
+    run(capsys, "alias", "G6Arena", "BenchPlug", "Strip:1")
+
+    run(capsys, "remove", "BenchPlug")
+
+    assert json.loads(saved.read_text())["aliases"]["G6Arena"] == "Strip:1"
+
+
+def test_log_best_effort_exits_zero_when_nothing_reachable(saved, capsys, fakes, tmp_path):
+    for f in fakes.values():
+        f.fail = "down"
+    out_csv = tmp_path / "run.csv"
+
+    rc, out, _ = run(capsys, "log", "Arena", "--out", str(out_csv), "--best-effort",
+                     "--interval-s", "0.01", "--retry-s", "0.02", "--duration-s", "0.1")
+
+    assert rc == 0 and "Wrote 0 samples" in out

@@ -48,7 +48,8 @@ class MqttConfig:
 @dataclass
 class Config:
     devices: dict[str, DeviceEntry] = field(default_factory=dict)
-    aliases: dict[str, str] = field(default_factory=dict)  # alias -> "Device:channel"
+    # alias -> "Device:channel", or an ordered list of them: the first reachable one is used
+    aliases: dict[str, str | list[str]] = field(default_factory=dict)
     tapo_account: str | None = None
     mqtt: MqttConfig = field(default_factory=MqttConfig)
 
@@ -98,6 +99,10 @@ class Config:
                 return d
         known = ", ".join(self.devices) or "none"
         raise PowerError(f"Unknown device {name!r} (configured: {known})")
+
+
+def alias_targets(value: str | list[str]) -> list[str]:
+    return [value] if isinstance(value, str) else list(value)
 
 
 def tapo_credentials(account: str | None) -> list[tuple[str, str]]:

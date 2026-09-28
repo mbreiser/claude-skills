@@ -11,12 +11,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
-from .config import Config, DeviceEntry, PowerError, WaitTimeout
+from .config import Config, DeviceEntry, PowerError, WaitTimeout, alias_targets
 from .model import Backend, ChannelStatus, DeviceStatus
 
 logger = logging.getLogger("labpower")
 
 CSV_FIELDS = ["timestamp", "elapsed_s", "device", "channel", "name", "on", "power_w", "voltage_v", "current_a"]
+RETRY_S = 30.0
+JOIN_TIMEOUT_S = 15.0
 
 Outlet = str | int
 
@@ -80,19 +82,27 @@ class Power:
     # --- naming ----------------------------------------------------------
 
     def _parse_target(self, target: str) -> tuple[str, int]:
+        """An alias target: Device:channel, or a single-outlet device's bare name."""
         device, _, channel = target.rpartition(":")
-        if not device or not channel.strip().isdigit():
+        if not device:
+            entry = self.config.device(target)
+            if entry.type == "zigbee2mqtt":
+                return entry.name, 1
+            raise PowerError(f"Bad outlet {target!r}; expected Device:channel, e.g. {entry.name}:1")
+        if not channel.strip().isdigit():
             raise PowerError(f"Bad outlet {target!r}; expected Device:channel, e.g. SmartPowerStrip:6")
         return self.config.device(device).name, int(channel)
 
     def resolve(self, outlet: Outlet) -> tuple[str, int]:
         """(device, channel) for an alias, Device:channel, a single-outlet
         device's name, a bare channel number (only with one strip configured),
-        or a Tapo outlet nickname."""
+        or a Tapo outlet nickname. An alias with several targets resolves to
+        the first one whose device answers."""
         key = str(outlet).strip()
-        for alias, target in self.config.aliases.items():
+        for alias, value in self.config.aliases.items():
             if alias.lower() == key.lower():
-                return self._parse_target(target)
+                targets = [self._parse_target(t) for t in alias_targets(value)]
+                return targets[0] if len(targets) == 1 else self._first_reachable(alias, targets)
         if ":" in key:
             return self._parse_target(key)
         strips = [d for d in self.config.devices.values() if d.type == "tapo-strip"]
@@ -119,11 +129,23 @@ class Power:
             f"devices: {', '.join(self.config.devices) or 'none'} (use Device:channel for strips)"
         )
 
+    def _first_reachable(self, alias: str, targets: list[tuple[str, int]]) -> tuple[str, int]:
+        errors = []
+        for device, channel in targets:
+            try:
+                if any(c.channel == channel for c in self.backend(device).channels()):
+                    return device, channel
+                errors.append(f"{device}:{channel}: no such outlet")
+            except PowerError as e:
+                errors.append(f"{device}:{channel}: {e}")
+        raise PowerError(f"No target of {alias!r} is reachable ({'; '.join(errors)})")
+
     def display_name(self, device: str, channel: int, native_name: str) -> str:
-        for alias, target in self.config.aliases.items():
-            with contextlib.suppress(PowerError):
-                if self._parse_target(target) == (device, channel):
-                    return alias
+        for alias, value in self.config.aliases.items():
+            for target in alias_targets(value):
+                with contextlib.suppress(PowerError):
+                    if self._parse_target(target) == (device, channel):
+                        return alias
         return native_name
 
     def _named(self, rows: list[ChannelStatus]) -> list[ChannelStatus]:
@@ -258,25 +280,53 @@ class Power:
         outlets: Iterable[Outlet] | None = None,
         stop: threading.Event | None = None,
         on_sample: Callable[[list[ChannelStatus]], None] | None = None,
+        best_effort: bool = False,
+        retry_s: float = RETRY_S,
     ) -> int:
         """Log readings as tidy CSV (one row per outlet per sample) until
         duration_s elapses or stop is set. A path is appended to (header only if
         new); a stream is written as-is. A device that fails a sample is logged
-        and skipped for that sample. Returns the number of samples written."""
-        kwargs = dict(interval_s=interval_s, duration_s=duration_s, outlets=outlets, stop=stop, on_sample=on_sample)
-        if hasattr(dest, "write"):
-            return self._log(dest, write_header=True, **kwargs)
-        path = Path(dest)
-        write_header = not path.exists() or path.stat().st_size == 0
-        with path.open("a", newline="") as f:
-            return self._log(f, write_header=write_header, **kwargs)
+        and skipped for that sample. Returns the number of samples written.
 
-    def _log(self, f: TextIO, *, write_header, interval_s, duration_s, outlets, stop, on_sample) -> int:
+        best_effort=True never raises: outlets that can't be resolved or read
+        are retried every retry_s, fallback aliases fail over to their next
+        target (and back to the first once it answers again), and a run with
+        nothing reachable just writes the header."""
+        kwargs = dict(interval_s=interval_s, duration_s=duration_s, outlets=outlets, stop=stop,
+                      on_sample=on_sample, best_effort=best_effort, retry_s=retry_s)
+        try:
+            if hasattr(dest, "write"):
+                return self._log(dest, write_header=True, **kwargs)
+            path = Path(dest)
+            write_header = not path.exists() or path.stat().st_size == 0
+            with path.open("a", newline="") as f:
+                return self._log(f, write_header=write_header, **kwargs)
+        except Exception as e:
+            if not best_effort or isinstance(e, KeyboardInterrupt):
+                raise
+            logger.warning("power logging stopped: %s", e)
+            return 0
+
+    def _log(self, f: TextIO, *, write_header, interval_s, duration_s, outlets, stop, on_sample,
+             best_effort, retry_s) -> int:
         stop = stop or threading.Event()
-        groups = self._groups(list(outlets) if outlets is not None else None)
+        outlets = list(outlets) if outlets is not None else None
         writer = csv.writer(f)
         if write_header:
             writer.writerow(CSV_FIELDS)
+            f.flush()
+        groups: dict[str, list[int] | None] | None = None
+        resolved_at = float("-inf")
+        warned_at: dict[str, float] = {}
+
+        def warn(key: str, msg: str) -> None:
+            # Once per retry period per problem, so a long outage doesn't flood the log.
+            if time.monotonic() - warned_at.get(key, float("-inf")) >= retry_s:
+                warned_at[key] = time.monotonic()
+                logger.warning("%s", msg)
+
+        if best_effort:
+            self._warm_up(outlets)
         t0 = time.monotonic()
         next_t = t0
         n = 0
@@ -284,10 +334,21 @@ class Power:
             now = time.monotonic()
             if duration_s is not None and now - t0 >= duration_s:
                 break
+            if groups is None or (best_effort and now - resolved_at >= retry_s):
+                resolved_at = now
+                try:
+                    groups = self._groups(outlets)
+                except PowerError as e:
+                    if not best_effort:
+                        raise
+                    groups = None
+                    warn("resolve", f"power logging: {e}; retrying every {retry_s:g} s")
             ts = datetime.now().astimezone().isoformat(timespec="milliseconds")
-            rows, errors = self._sample_groups(groups)
+            rows, errors = self._sample_groups(groups) if groups else ([], {})
             for device, err in errors.items():
-                logger.warning("sample failed for %s: %s", device, err)
+                warn(device, f"sample failed for {device}: {err}")
+            if errors and best_effort:
+                resolved_at = float("-inf")  # re-resolve next time, so fallback aliases fail over
             if rows:
                 for r in rows:
                     writer.writerow([ts, f"{now - t0:.3f}", r.device, r.channel, r.name, int(r.on),
@@ -296,9 +357,29 @@ class Power:
                 n += 1
                 if on_sample:
                     on_sample(rows)
-            next_t += interval_s
+            if best_effort and groups is None:  # nothing reachable: back off
+                next_t = time.monotonic() + retry_s
+            else:  # including after a failed sample: fail over on the next tick
+                next_t += interval_s
             stop.wait(max(0.0, next_t - time.monotonic()))
         return n
+
+    def _warm_up(self, outlets: list[Outlet] | None) -> None:
+        """Connect every device a fallback alias might fail over to, in parallel,
+        so a failover doesn't wait for a (slow) Tapo handshake."""
+        devices = set(self.config.devices) if outlets is None else set()
+        for o in outlets or []:
+            for alias, value in self.config.aliases.items():
+                if alias.lower() == str(o).strip().lower():
+                    for t in alias_targets(value):
+                        with contextlib.suppress(PowerError):
+                            devices.add(self._parse_target(t)[0])
+
+        def probe(device: str) -> None:
+            with contextlib.suppress(Exception):
+                self.backend(device).channels()
+
+        list(self._pool.map(probe, devices))
 
     @contextlib.contextmanager
     def background_log(
@@ -307,13 +388,18 @@ class Power:
         *,
         interval_s: float = 1.0,
         outlets: Iterable[Outlet] | None = None,
+        best_effort: bool = False,
+        retry_s: float = RETRY_S,
     ) -> Iterator[None]:
-        """Log readings to CSV in a background thread for the duration of a with-block."""
+        """Log readings to CSV in a background thread for the duration of a
+        with-block. With best_effort=True the block is never affected by power
+        problems (see log_csv)."""
         stop = threading.Event()
         t = threading.Thread(
             target=self.log_csv,
             args=(path,),
-            kwargs={"interval_s": interval_s, "outlets": outlets, "stop": stop},
+            kwargs={"interval_s": interval_s, "outlets": outlets, "stop": stop,
+                    "best_effort": best_effort, "retry_s": retry_s},
             daemon=True,
             name="labpower-log",
         )
@@ -322,4 +408,6 @@ class Power:
             yield
         finally:
             stop.set()
-            t.join()
+            # A best-effort logger may be mid-way through probing an unreachable
+            # device; don't hold the caller up longer than one connect attempt.
+            t.join(timeout=JOIN_TIMEOUT_S if best_effort else None)

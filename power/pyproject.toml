@@ -1,6 +1,6 @@
 [project]
 name = "labpower"
-version = "0.4.0"
+version = "0.5.0"
 description = "Switch, power-cycle, and measure lab power outlets: Tapo P316M/P304M strips and Zigbee2MQTT plugs"
 requires-python = ">=3.11"
 dependencies = [

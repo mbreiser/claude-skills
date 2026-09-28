@@ -212,3 +212,99 @@ def test_unknown_device_type_is_an_error():
     cfg = Config(devices={"X": DeviceEntry(name="X", type="snmp-pdu")})
     with Power(cfg) as p, pytest.raises(PowerError, match="unknown device type"):
         p.backend("X")
+
+
+# --- fallback aliases --------------------------------------------------------
+
+
+@pytest.fixture
+def g6(power, lab_config):
+    lab_config.aliases["G6Arena"] = ["BenchPlug", "Strip:1"]
+    return power
+
+
+def test_fallback_alias_uses_first_reachable(g6, fakes):
+    assert g6.resolve("G6Arena") == ("BenchPlug", 1)
+    fakes["BenchPlug"].fail = "Timed out waiting for BenchPlug"
+    assert g6.resolve("G6Arena") == ("Strip", 1)
+
+
+def test_fallback_alias_none_reachable(g6, fakes):
+    fakes["BenchPlug"].fail = fakes["Strip"].fail = "down"
+    with pytest.raises(PowerError, match="No target of 'G6Arena' is reachable"):
+        g6.resolve("G6Arena")
+
+
+def test_fallback_alias_names_every_target(g6):
+    assert g6.display_name("BenchPlug", 1, "BenchPlug") == "G6Arena"
+    assert g6.display_name("Strip", 1, "Plug 1") == "G6Arena"
+
+
+def test_cycle_on_fallback_stays_on_one_target(g6, fakes, no_sleep):
+    fakes["BenchPlug"].fail = "down"
+    g6.cycle("G6Arena", off_s=0)
+    assert fakes["Strip"].calls == [(1, False), (1, True)]
+
+
+# --- best-effort logging -------------------------------------------------------
+
+
+def test_best_effort_log_with_nothing_reachable_writes_header_only(g6, fakes, tmp_path):
+    fakes["BenchPlug"].fail = fakes["Strip"].fail = "down"
+    path = tmp_path / "p.csv"
+
+    n = g6.log_csv(path, interval_s=0.01, duration_s=0.1, outlets=["G6Arena"], best_effort=True, retry_s=0.02)
+
+    assert n == 0
+    assert path.read_text().strip() == ",".join(CSV_FIELDS)
+
+
+def test_strict_log_with_nothing_reachable_raises(g6, fakes, tmp_path):
+    fakes["BenchPlug"].fail = fakes["Strip"].fail = "down"
+    with pytest.raises(PowerError):
+        g6.log_csv(tmp_path / "p.csv", interval_s=0.01, duration_s=0.1, outlets=["G6Arena"])
+
+
+def test_best_effort_log_fails_over_and_back(g6, fakes, tmp_path):
+    path = tmp_path / "p.csv"
+    seen = []
+
+    def script(rows):
+        seen.append(rows[0].device)
+        if len(seen) == 3:
+            fakes["BenchPlug"].fail = "Timed out waiting for BenchPlug"
+        if len(seen) == 8:
+            fakes["BenchPlug"].fail = None
+
+    g6.log_csv(path, interval_s=0.01, duration_s=0.5, outlets=["G6Arena"], best_effort=True, retry_s=0.05,
+               on_sample=script)
+
+    assert seen[:3] == ["BenchPlug"] * 3
+    assert "Strip" in seen[3:8]
+    assert seen[-1] == "BenchPlug"
+    devices = {line.split(",")[2] for line in path.read_text().splitlines()[1:]}
+    assert devices == {"BenchPlug", "Strip"}
+
+
+def test_best_effort_log_ignores_unknown_outlets(power, tmp_path):
+    n = power.log_csv(tmp_path / "p.csv", interval_s=0.01, duration_s=0.05, outlets=["Nope"],
+                      best_effort=True, retry_s=0.02)
+    assert n == 0
+
+
+def test_best_effort_background_log_never_breaks_the_block(power, tmp_path):
+    bad = tmp_path / "missing-dir" / "p.csv"
+    with power.background_log(bad, interval_s=0.01, outlets=["BenchPlug"], best_effort=True):
+        time.sleep(0.02)
+    assert not bad.exists()
+
+
+def test_best_effort_log_warms_up_fallback_devices(g6, fakes, monkeypatch):
+    probed = []
+    for name, fake in fakes.items():
+        orig = fake.channels
+        monkeypatch.setattr(fake, "channels", lambda orig=orig, name=name: probed.append(name) or orig())
+
+    g6.log_csv(io.StringIO(), interval_s=0.01, duration_s=0.02, outlets=["G6Arena"], best_effort=True)
+
+    assert {"BenchPlug", "Strip"} <= set(probed)

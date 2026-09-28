@@ -5,10 +5,11 @@ import contextlib
 import getpass
 import json
 import logging
+import signal
 import sys
 from dataclasses import asdict
 
-from .config import Config, DeviceEntry, PowerError, WaitTimeout, store_tapo_password
+from .config import Config, DeviceEntry, PowerError, WaitTimeout, alias_targets, store_tapo_password
 from .core import Power
 from .model import ChannelStatus, DeviceStatus
 
@@ -147,8 +148,14 @@ def _live_line(rows: list[ChannelStatus]) -> None:
     print(f"\r{parts}  total={sum(r.power_w or 0 for r in rows):.1f}W ", end="", file=sys.stderr, flush=True)
 
 
+def _sigterm_as_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def cmd_log(args, cfg):
-    kwargs = dict(interval_s=args.interval_s, duration_s=args.duration_s, outlets=args.outlets or None)
+    signal.signal(signal.SIGTERM, _sigterm_as_interrupt)  # lets a parent process stop the logger cleanly
+    kwargs = dict(interval_s=args.interval_s, duration_s=args.duration_s, outlets=args.outlets or None,
+                  best_effort=args.best_effort, retry_s=args.retry_s)
     with Power(cfg) as p:
         if args.out is None:
             p.log_csv(sys.stdout, **kwargs)
@@ -292,9 +299,14 @@ def cmd_add_zigbee(args, cfg):
 def cmd_remove(args, cfg):
     entry = cfg.device(args.name)
     del cfg.devices[entry.name]
-    dropped = [a for a, t in cfg.aliases.items() if t.rpartition(":")[0].lower() == entry.name.lower()]
-    for a in dropped:
-        del cfg.aliases[a]
+    dropped = []
+    for a, value in list(cfg.aliases.items()):
+        kept = [t for t in alias_targets(value) if t.rpartition(":")[0].lower() != entry.name.lower()]
+        if not kept:
+            del cfg.aliases[a]
+            dropped.append(a)
+        elif len(kept) < len(alias_targets(value)):
+            cfg.aliases[a] = kept[0] if len(kept) == 1 else kept
     cfg.save()
     print(f"Removed {entry.name!r}" + (f" and its aliases {', '.join(dropped)}" if dropped else ""))
 
@@ -303,12 +315,20 @@ def cmd_alias(args, cfg):
     _check_new_name(cfg, args.alias)
     if any(n.lower() == args.alias.lower() for n in cfg.devices):
         raise PowerError(f"{args.alias!r} is already a device name")
+    targets = []
     with Power(cfg) as p:
-        device, channel = p.resolve(args.outlet)
-    cfg.aliases = {a: t for a, t in cfg.aliases.items() if a.lower() != args.alias.lower() and t != f"{device}:{channel}"}
-    cfg.aliases[args.alias] = f"{device}:{channel}"
+        for outlet in args.outlets:
+            if ":" in outlet:  # validate the device without needing it online (fallback targets may be down)
+                device, channel = p._parse_target(outlet)
+            else:
+                device, channel = p.resolve(outlet)
+            targets.append(f"{device}:{channel}")
+    others = {a: t for a, t in cfg.aliases.items() if a.lower() != args.alias.lower()}
+    if len(targets) == 1:  # one name per outlet: drop other single-target aliases of the same outlet
+        others = {a: t for a, t in others.items() if t != targets[0]}
+    cfg.aliases = {**others, args.alias: targets[0] if len(targets) == 1 else targets}
     cfg.save()
-    print(f"{args.alias} -> {device}:{channel}")
+    print(f"{args.alias} -> {' | '.join(targets)}" + ("  (first reachable wins)" if len(targets) > 1 else ""))
 
 
 def cmd_unalias(args, cfg):
@@ -365,7 +385,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("outlets", nargs="*", help="outlets to log (default: all)")
     s.add_argument("--out", help="CSV file to append to")
     s.add_argument("--interval-s", type=float, default=1.0)
-    s.add_argument("--duration-s", type=float, help="stop after this long (default: until Ctrl-C)")
+    s.add_argument("--duration-s", type=float, help="stop after this long (default: until Ctrl-C / SIGTERM)")
+    s.add_argument("--best-effort", action="store_true",
+                   help="never fail: retry unreachable outlets, fail over fallback aliases, exit 0")
+    s.add_argument("--retry-s", type=float, default=30.0, help="best-effort retry period (default 30)")
     s.set_defaults(fn=cmd_log)
 
     s = sub.add_parser("discover", help="find Tapo strips on the LAN and devices paired with Zigbee2MQTT")
@@ -387,9 +410,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("name")
     s.set_defaults(fn=cmd_remove)
 
-    s = sub.add_parser("alias", help="name an outlet, e.g. `alias ArenaPS SmartPowerStrip:6`")
+    s = sub.add_parser("alias", help="name an outlet, e.g. `alias ArenaPS SmartPowerStrip:6`; "
+                                     "several outlets = fallbacks, first reachable wins")
     s.add_argument("alias")
-    s.add_argument("outlet", help=outlet_help)
+    s.add_argument("outlets", nargs="+", metavar="outlet", help=outlet_help)
     s.set_defaults(fn=cmd_alias)
 
     s = sub.add_parser("unalias", help="remove an alias")

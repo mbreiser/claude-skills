@@ -182,3 +182,16 @@ def test_burst_leftovers_do_not_answer_the_next_request():
 
     assert b.get("BenchPlug", ["voltage"])["voltage"] == 120.2
     assert b.get("BenchPlug", ["voltage"])["voltage"] == 121.0
+
+
+def test_requests_fail_fast_once_bridge_goes_offline():
+    client, _ = fake_z2m()
+    b = bridge_for(client, timeout_s=5)
+    client.deliver("zigbee2mqtt/bridge/state", {"state": "offline"})
+
+    import time
+    t = time.monotonic()
+    with pytest.raises(PowerError, match="Zigbee2MQTT is offline"):
+        b.get("BenchPlug", ["power"])
+    assert time.monotonic() - t < 0.5
+    assert not any(topic.endswith("/get") for topic, _ in client.published)

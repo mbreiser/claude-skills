@@ -11,7 +11,7 @@ from collections.abc import Callable
 from .config import DeviceEntry, MqttConfig, PowerError
 from .model import ChannelStatus, DeviceStatus
 
-REQUEST_TIMEOUT_S = 5
+REQUEST_TIMEOUT_S = 3  # a W/V/A read normally takes ~0.3 s
 # Zigbee2MQTT publishes the full state once per attribute it reads or the
 # device reports (a W/V/A read is three messages ~40 ms apart). A request is
 # answered once the burst has been quiet this long.
@@ -106,6 +106,9 @@ class Z2MBridge:
         burst of follow-up messages to end, and return the last state — so every
         requested value is fresh and no leftovers answer the next request."""
         with self._cond:
+            if self._bridge_state != "online":
+                # Zigbee2MQTT publishes a retained "offline" when it stops; fail now instead of timing out.
+                raise PowerError(f"Zigbee2MQTT is {self._bridge_state or 'not answering'}; {friendly_name} is unreachable")
             seq0 = self._seq.get(friendly_name, 0)
         self._client.publish(f"{self._base}/{friendly_name}/{suffix}", json.dumps(payload))
         deadline = time.monotonic() + self._timeout_s
@@ -157,7 +160,7 @@ class Z2MPlug:
         )
 
     def channels(self) -> list[ChannelStatus]:
-        st = self._bridge.cached(self._friendly) or self._bridge.get(self._friendly, ["state"])
+        st = self._bridge.get(self._friendly, ["state"])
         return [ChannelStatus(device=self.name, channel=1, native_name=self._friendly, on=st.get("state") == "ON")]
 
     def sample(self, channels: list[int] | None = None) -> list[ChannelStatus]:

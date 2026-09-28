@@ -32,6 +32,8 @@ Anywhere an outlet is expected, give one of:
 
 Matching is case-insensitive and exact. Aliases are global, so moving a load to another device only means re-pointing its alias.
 
+**Fallback aliases.** An alias may list several targets, most preferred first: `power alias G6Arena BenchPlug SmartPowerStrip:1` stores `"G6Arena": ["BenchPlug:1", "SmartPowerStrip:1"]`, and every command uses the first target whose device answers. This is for loads that more than one device can reach — here BenchPlug is plugged into strip outlet 1, so both meter the G6 arena (the strip reads ~1 W more: BenchPlug's own draw) and switching either one cuts the arena. Switching through the fallback also powers down whatever sits between (here BenchPlug itself).
+
 ## Before switching anything (agent rule)
 
 Cutting power is not undoable for whatever is plugged in. Before `off` or `cycle` on an outlet the user hasn't explicitly named in this conversation, run `power status` and confirm with the user which load is on it. Never switch every outlet as a "test". An outlet drawing power with no alias is unknown equipment — ask. Don't send commands to a Zigbee plug while its firmware update is running.
@@ -109,7 +111,9 @@ power log ArenaPS BenchPlug --out run.csv --interval-s 1 --duration-s 3600
 
 Exit codes: `0` ok · `1` device / network / auth / unknown-outlet error (message on stderr) · `2` bad arguments · `3` `--wait-above-w` not reached before timeout · `130` Ctrl-C. `status` exits 1 only if no device is reachable.
 
-`log --out` appends (header only for a new file), flushes every sample, and shows a live readout on stderr in a terminal. Devices are sampled in parallel; a device that fails a sample is skipped for that sample with a warning, and the rest keep logging.
+`log --out` appends (header only for a new file), flushes every sample, and shows a live readout on stderr in a terminal. Devices are sampled in parallel; a device that fails a sample is skipped for that sample with a warning, and the rest keep logging. SIGTERM stops it cleanly (for callers running it as a subprocess).
+
+**Best-effort logging** — `power log G6Arena --out run.csv --best-effort` (Python: `log_csv(..., best_effort=True)` / `background_log(..., best_effort=True)`) is for logging alongside something more important. It never fails the caller: unresolvable or unreachable outlets are retried every `--retry-s` (30 s), fallback aliases fail over on the next sample and move back to the preferred target when it answers again, nothing reachable just leaves a header-only CSV, and the exit code is 0. Measured failover (stopping Zigbee2MQTT mid-log with `G6Arena` = BenchPlug → strip outlet 1): 99 rows in 99 s, largest gap 2.1 s, back on BenchPlug 3 s after Zigbee2MQTT restarted. The `device` column records which meter each row came from.
 
 ## Python API (other projects)
 
@@ -140,6 +144,12 @@ with Power() as p:                                  # uses ~/.config/power/confi
 ```
 
 `Power` is synchronous and thread-safe (each Tapo strip runs its own event loop thread; Zigbee shares one MQTT session), so it works from scripts, Jupyter, and async code. Devices connect lazily on first use. Errors are `PowerError`; `WaitTimeout` subclasses it.
+
+## Using it from other projects (G6 firmware, webDisplayTools, …)
+
+- **Name outlets by role, not device.** Project code only says `G6Arena`; each machine's `~/.config/power/config.json` maps that to whatever is there (fallback list included). Nothing device-specific goes in the project.
+- **Prefer the CLI as a subprocess** for projects with their own environments (pixi, MATLAB): no dependency to add, and a missing skill or missing device can't break the project. Start `~/.claude/skills/power/bin/power log G6Arena --out <run>-power.csv --best-effort` next to the run; send SIGTERM at the end. Check the path exists first and skip power logging if not — collaborators without the skill are unaffected.
+- **For a Python dependency, pin a tag**, never `main`: `labpower @ git+https://github.com/mbreiser/claude-skills@power-v0.5.0#subdirectory=power`. Guard the import (`try: from labpower import Power` / `except ImportError: Power = None`) and use `best_effort=True`.
 
 ## MATLAB
 
